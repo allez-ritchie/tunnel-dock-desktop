@@ -262,6 +262,7 @@ async fn authenticate(
     }
 }
 
+#[derive(Debug)]
 pub struct SshTunnel {
     local_port: u16,
     cancel: CancellationToken,
@@ -299,6 +300,12 @@ impl Drop for SshTunnel {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+async fn disconnect_handles(handles: &[Handle<ClientHandler>]) {
+    for handle in handles.iter().rev() {
+        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
     }
 }
 
@@ -364,6 +371,7 @@ pub async fn connect(
                     Ok(channel) => channel,
                     Err(error) => {
                         let _ = parent.disconnect(Disconnect::ByApplication, "", "").await;
+                        disconnect_handles(&handles).await;
                         return Err(error);
                     }
                 };
@@ -377,8 +385,10 @@ pub async fn connect(
                     Ok(handle) => handle,
                     Err(error) => {
                         if security_alert.load(Ordering::SeqCst) {
+                            disconnect_handles(&handles).await;
                             return Err(TunnelError::HostKeyChanged);
                         }
+                        disconnect_handles(&handles).await;
                         return Err(error);
                     }
                 }
@@ -387,9 +397,7 @@ pub async fn connect(
 
         if let Err(error) = authenticate(&mut handle, hop, context, timeout).await {
             let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-            for parent in handles.iter().rev() {
-                let _ = parent.disconnect(Disconnect::ByApplication, "", "").await;
-            }
+            disconnect_handles(&handles).await;
             return Err(error);
         }
         upstream = Some(handle);
@@ -401,9 +409,7 @@ pub async fn connect(
     let listener = match TcpListener::bind((config.local_host.as_str(), config.local_port)).await {
         Ok(listener) => listener,
         Err(error) => {
-            for handle in handles.iter().rev() {
-                let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-            }
+            disconnect_handles(&handles).await;
             return if error.kind() == std::io::ErrorKind::AddrInUse {
                 Err(TunnelError::PortInUse)
             } else {
@@ -495,9 +501,7 @@ async fn supervise(
     };
 
     let _ = target.disconnect(Disconnect::ByApplication, "", "").await;
-    for handle in handles.iter().rev() {
-        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-    }
+    disconnect_handles(&handles).await;
     connections.shutdown().await;
     reason
 }
@@ -513,6 +517,10 @@ mod tests {
         std::env::var(key).unwrap_or_else(|_| fallback.to_string())
     }
 
+    fn env_required(key: &str, hint: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set: {hint}"))
+    }
+
     #[test]
     fn maps_io_errors_to_readable_codes() {
         let refused = russh::Error::IO(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
@@ -524,63 +532,71 @@ mod tests {
         assert!(matches!(map_russh_error(timeout), TunnelError::Timeout));
     }
 
-    /// End-to-end check against a real sshd. Run with:
-    /// `TD_E2E_KEY=/path/to/key TD_E2E_WITH_JUMP=1 cargo test e2e_forward -- --ignored`
-    #[tokio::test]
-    #[ignore = "requires a local sshd and HTTP server"]
-    async fn e2e_forward() {
-        let key_path = std::env::var("TD_E2E_KEY").expect("TD_E2E_KEY must point at a private key");
-        let private_key = std::fs::read_to_string(key_path).unwrap();
-        let host = env_or("TD_E2E_HOST", "127.0.0.1");
-        let port: u16 = env_or("TD_E2E_PORT", "2222").parse().unwrap();
-        let user = env_or("TD_E2E_USER", "rt");
-        let remote_host = env_or("TD_E2E_REMOTE_HOST", "127.0.0.1");
-        let remote_port: u16 = env_or("TD_E2E_REMOTE_PORT", "8080").parse().unwrap();
+    /// Shared fixture for the sshd-backed tests. Everything (master key,
+    /// known-hosts store, tunnel config) lives in a temp dir so runs do not
+    /// touch the real application data.
+    struct E2e {
+        dir: tempfile::TempDir,
+        secrets: Arc<Secrets>,
+        known_hosts: Arc<KnownHosts>,
+        config: TunnelConfig,
+    }
+
+    impl E2e {
+        async fn new(auth_type: AuthType, secret: &str) -> Self {
+            let host = env_or("TD_E2E_HOST", "127.0.0.1");
+            let port: u16 = env_or("TD_E2E_PORT", "2222").parse().unwrap();
+            let user = env_or("TD_E2E_USER", "rt");
+            let dir = tempfile::tempdir().unwrap();
+            let secrets = Secrets::load(dir.path()).unwrap();
+            let known_hosts = Arc::new(KnownHosts::load(dir.path()).await.unwrap());
+            let credentials = match auth_type {
+                AuthType::Password => SshCredentials {
+                    auth_type,
+                    password_cipher: Some(secrets.encrypt(secret).unwrap()),
+                    ..SshCredentials::default()
+                },
+                AuthType::PrivateKey => SshCredentials {
+                    auth_type,
+                    private_key_cipher: Some(secrets.encrypt(secret).unwrap()),
+                    ..SshCredentials::default()
+                },
+            };
+            let config = TunnelConfig {
+                name: "e2e".into(),
+                local_port: 0,
+                remote_host: env_or("TD_E2E_REMOTE_HOST", "127.0.0.1"),
+                remote_port: env_or("TD_E2E_REMOTE_PORT", "8080").parse().unwrap(),
+                ssh_host: host,
+                ssh_port: port,
+                ssh_user: user,
+                credentials,
+                keep_alive_seconds: 5,
+                connect_timeout_seconds: 10,
+                ..TunnelConfig::default()
+            };
+            Self {
+                dir,
+                secrets,
+                known_hosts,
+                config,
+            }
+        }
+
+        fn context(&self) -> ConnectContext {
+            ConnectContext {
+                secrets: self.secrets.clone(),
+                known_hosts: self.known_hosts.clone(),
+            }
+        }
+
+        fn host_key(&self) -> String {
+            format!("{}:{}", self.config.ssh_host, self.config.ssh_port)
+        }
+    }
+
+    async fn assert_http_forwarded(local_port: u16) {
         let marker = env_or("TD_E2E_EXPECT", "TUNNELDOCK_E2E_MARKER_42");
-
-        let dir = tempfile::tempdir().unwrap();
-        let secrets = Secrets::load(dir.path()).unwrap();
-        let known_hosts = KnownHosts::load(dir.path()).await.unwrap();
-        let credentials = SshCredentials {
-            auth_type: AuthType::PrivateKey,
-            private_key_cipher: Some(secrets.encrypt(&private_key).unwrap()),
-            ..SshCredentials::default()
-        };
-        let with_jump = std::env::var("TD_E2E_WITH_JUMP").is_ok();
-        let jumps = if with_jump {
-            vec![JumpHost {
-                host: host.clone(),
-                port,
-                username: user.clone(),
-                credentials: credentials.clone(),
-                ..JumpHost::default()
-            }]
-        } else {
-            Vec::new()
-        };
-        let config = TunnelConfig {
-            name: "e2e".into(),
-            local_port: 0,
-            remote_host,
-            remote_port,
-            ssh_host: host,
-            ssh_port: port,
-            ssh_user: user,
-            credentials,
-            jumps,
-            keep_alive_seconds: 5,
-            connect_timeout_seconds: 10,
-            ..TunnelConfig::default()
-        };
-        let context = ConnectContext {
-            secrets,
-            known_hosts: Arc::new(known_hosts),
-        };
-
-        let mut tunnel = connect(&context, &config).await.expect("tunnel connects");
-        let local_port = tunnel.local_port();
-        assert!(local_port > 0);
-
         let mut stream = TcpStream::connect(("127.0.0.1", local_port)).await.unwrap();
         stream
             .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
@@ -590,6 +606,133 @@ mod tests {
         stream.read_to_end(&mut response).await.unwrap();
         let text = String::from_utf8_lossy(&response);
         assert!(text.contains(&marker), "unexpected response: {text}");
+    }
+
+    /// End-to-end forwarding against a real sshd. Run with:
+    /// `TD_E2E_KEY=/path/to/key TD_E2E_WITH_JUMP=1 cargo test e2e_forward -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires a local sshd and HTTP server"]
+    async fn e2e_forward() {
+        let private_key = std::fs::read_to_string(env_required(
+            "TD_E2E_KEY",
+            "path to an authorized private key",
+        ))
+        .unwrap();
+        let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
+        let mut config = setup.config.clone();
+        if std::env::var("TD_E2E_WITH_JUMP").is_ok() {
+            config.jumps = vec![JumpHost {
+                host: config.ssh_host.clone(),
+                port: config.ssh_port,
+                username: config.ssh_user.clone(),
+                credentials: config.credentials.clone(),
+                ..JumpHost::default()
+            }];
+        }
+
+        let mut tunnel = connect(&setup.context(), &config)
+            .await
+            .expect("tunnel connects");
+        assert!(tunnel.local_port() > 0);
+        assert_http_forwarded(tunnel.local_port()).await;
+        tunnel.close().await;
+    }
+
+    /// A pinned host key that no longer matches must abort the connection and
+    /// surface the security error instead of silently re-pinning.
+    #[tokio::test]
+    #[ignore = "requires a local sshd"]
+    async fn e2e_rejects_changed_host_key() {
+        let private_key =
+            std::fs::read_to_string(env_required("TD_E2E_KEY", "private key")).unwrap();
+        let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
+        let mut tunnel = connect(&setup.context(), &setup.config)
+            .await
+            .expect("first connect pins the key");
+        tunnel.close().await;
+
+        let mut hosts = serde_json::Map::new();
+        hosts.insert(
+            setup.host_key(),
+            serde_json::json!({
+                "fingerprint": "SHA256:changed-on-purpose",
+                "keyType": "ssh-ed25519",
+                "addedAt": 0
+            }),
+        );
+        let document = serde_json::json!({ "version": 1, "hosts": hosts });
+        tokio::fs::write(
+            setup.dir.path().join("known_hosts.json"),
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let known_hosts = Arc::new(KnownHosts::load(setup.dir.path()).await.unwrap());
+        let context = ConnectContext {
+            secrets: setup.secrets.clone(),
+            known_hosts,
+        };
+        let error = connect(&context, &setup.config)
+            .await
+            .expect_err("changed host key must be refused");
+        assert!(
+            matches!(error, TunnelError::HostKeyChanged),
+            "unexpected error: {error:?}"
+        );
+        assert!(error.security_alert());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local sshd"]
+    async fn e2e_reports_port_in_use() {
+        let private_key =
+            std::fs::read_to_string(env_required("TD_E2E_KEY", "private key")).unwrap();
+        let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
+        let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let mut config = setup.config.clone();
+        config.local_port = port;
+
+        let error = connect(&setup.context(), &config)
+            .await
+            .expect_err("bound local port must be refused");
+        assert!(
+            matches!(error, TunnelError::PortInUse),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local sshd"]
+    async fn e2e_reports_auth_failure() {
+        let unauthorized = std::fs::read_to_string(env_required(
+            "TD_E2E_BAD_KEY",
+            "an ed25519 private key that is NOT in authorized_keys",
+        ))
+        .unwrap();
+        let setup = E2e::new(AuthType::PrivateKey, &unauthorized).await;
+        let error = connect(&setup.context(), &setup.config)
+            .await
+            .expect_err("unauthorized key must fail");
+        assert!(
+            matches!(error, TunnelError::AuthFailed),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// Password auth against an sshd configured with a known password.
+    #[tokio::test]
+    #[ignore = "requires a local sshd with password authentication and TD_E2E_PASSWORD"]
+    async fn e2e_password_auth() {
+        let password = env_required("TD_E2E_PASSWORD", "test account password");
+        let setup = E2e::new(AuthType::Password, &password).await;
+        let mut tunnel = connect(&setup.context(), &setup.config)
+            .await
+            .expect("password auth connects");
+        assert_http_forwarded(tunnel.local_port()).await;
         tunnel.close().await;
     }
 }
