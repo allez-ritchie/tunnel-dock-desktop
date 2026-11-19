@@ -1,5 +1,5 @@
 use crate::known_hosts::{HostKeyDecision, KnownHosts};
-use crate::model::{AuthType, SshCredentials, TunnelConfig};
+use crate::model::{AuthType, ForwardApp, SshCredentials, TunnelConfig, LOOPBACK};
 use crate::secrets::Secrets;
 use russh::client::{self, AuthResult, Config, Handle, Handler};
 use russh::keys::{decode_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
@@ -119,7 +119,7 @@ where
     }
 }
 
-/// Verifies the server key against the TOFU store. `StrictHostKeyChecking=no`
+/// Verifies the server key against the TOFU store. `strict_host_key = false`
 /// behaves like OpenSSH: accept anything and do not pin it.
 pub struct ClientHandler {
     host: String,
@@ -188,8 +188,28 @@ pub struct ConnectContext {
     pub known_hosts: Arc<KnownHosts>,
 }
 
-fn hop_chain(config: &TunnelConfig) -> Vec<Hop> {
-    let mut hops: Vec<Hop> = config
+/// The local listener and remote target for one running application.
+#[derive(Debug, Clone)]
+pub struct ForwardSpec {
+    pub local_host: String,
+    pub local_port: u16,
+    pub remote_host: String,
+    pub remote_port: u16,
+}
+
+impl From<&ForwardApp> for ForwardSpec {
+    fn from(app: &ForwardApp) -> Self {
+        Self {
+            local_host: LOOPBACK.to_string(),
+            local_port: app.local_port,
+            remote_host: app.remote_host.clone(),
+            remote_port: app.remote_port,
+        }
+    }
+}
+
+fn hop_chain(tunnel: &TunnelConfig) -> Vec<Hop> {
+    let mut hops: Vec<Hop> = tunnel
         .jumps
         .iter()
         .map(|jump| Hop {
@@ -200,10 +220,10 @@ fn hop_chain(config: &TunnelConfig) -> Vec<Hop> {
         })
         .collect();
     hops.push(Hop {
-        host: config.ssh_host.clone(),
-        port: config.ssh_port,
-        username: config.ssh_user.clone(),
-        credentials: config.credentials.clone(),
+        host: tunnel.ssh_host.clone(),
+        port: tunnel.ssh_port,
+        username: tunnel.ssh_user.clone(),
+        credentials: tunnel.credentials.clone(),
     });
     hops
 }
@@ -262,6 +282,118 @@ async fn authenticate(
     }
 }
 
+async fn disconnect_handles(handles: &[Handle<ClientHandler>]) {
+    for handle in handles.iter().rev() {
+        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+    }
+}
+
+/// Opens every SSH hop in order, authenticates each one, and returns the
+/// handles from the nearest jump to the target server. No local listener is
+/// created. Both the forwarding connection and the connectivity probe use this.
+async fn dial_chain(
+    context: &ConnectContext,
+    tunnel: &TunnelConfig,
+) -> Result<Vec<Handle<ClientHandler>>, TunnelError> {
+    let timeout = Duration::from_secs(tunnel.connect_timeout_seconds.clamp(5, 120) as u64);
+    let keepalive = Duration::from_secs(tunnel.keep_alive_seconds.clamp(5, 300) as u64);
+    let ssh_config = Arc::new(Config {
+        keepalive_interval: Some(keepalive),
+        keepalive_max: 3,
+        nodelay: true,
+        ..Config::default()
+    });
+
+    let hops = hop_chain(tunnel);
+    let mut handles: Vec<Handle<ClientHandler>> = Vec::new();
+    let mut upstream: Option<Handle<ClientHandler>> = None;
+
+    for hop in &hops {
+        if hop.host.trim().is_empty() {
+            disconnect_handles(&handles).await;
+            return Err(TunnelError::Connect("SSH 主机地址为空".into()));
+        }
+        let security_alert = Arc::new(AtomicBool::new(false));
+        let handler = ClientHandler::new(
+            &hop.host,
+            hop.port,
+            tunnel.strict_host_key,
+            context.known_hosts.clone(),
+            security_alert.clone(),
+        );
+
+        let mut handle = match upstream.take() {
+            None => {
+                let result = timed(
+                    timeout,
+                    client::connect(ssh_config.clone(), (hop.host.as_str(), hop.port), handler),
+                )
+                .await;
+                match result {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        if security_alert.load(Ordering::SeqCst) {
+                            return Err(TunnelError::HostKeyChanged);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            Some(parent) => {
+                let channel = match timed(
+                    timeout,
+                    parent.channel_open_direct_tcpip(
+                        hop.host.clone(),
+                        hop.port as u32,
+                        LOOPBACK,
+                        0,
+                    ),
+                )
+                .await
+                {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        let _ = parent.disconnect(Disconnect::ByApplication, "", "").await;
+                        disconnect_handles(&handles).await;
+                        return Err(error);
+                    }
+                };
+                handles.push(parent);
+                let result = timed(
+                    timeout,
+                    client::connect_stream(ssh_config.clone(), channel.into_stream(), handler),
+                )
+                .await;
+                match result {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        disconnect_handles(&handles).await;
+                        if security_alert.load(Ordering::SeqCst) {
+                            return Err(TunnelError::HostKeyChanged);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        };
+
+        if let Err(error) = authenticate(&mut handle, hop, context, timeout).await {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+            disconnect_handles(&handles).await;
+            return Err(error);
+        }
+        upstream = Some(handle);
+    }
+
+    match upstream {
+        Some(target) => {
+            handles.push(target);
+            Ok(handles)
+        }
+        None => Err(TunnelError::Connect("没有可用的 SSH 连接".into())),
+    }
+}
+
 #[derive(Debug)]
 pub struct SshTunnel {
     local_port: u16,
@@ -303,110 +435,25 @@ impl Drop for SshTunnel {
     }
 }
 
-async fn disconnect_handles(handles: &[Handle<ClientHandler>]) {
-    for handle in handles.iter().rev() {
-        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-    }
+/// Authenticates through the whole jump chain without installing a local
+/// listener, then disconnects. Used by the tunnel connectivity test so a probe
+/// never touches a running application or binds a port.
+pub async fn probe(context: &ConnectContext, tunnel: &TunnelConfig) -> Result<(), TunnelError> {
+    let handles = dial_chain(context, tunnel).await?;
+    disconnect_handles(&handles).await;
+    Ok(())
 }
 
+/// Dials the tunnel and installs the application's local forward.
 pub async fn connect(
     context: &ConnectContext,
-    config: &TunnelConfig,
+    tunnel: &TunnelConfig,
+    forward: &ForwardSpec,
 ) -> Result<SshTunnel, TunnelError> {
-    let timeout = Duration::from_secs(config.connect_timeout_seconds.clamp(5, 120) as u64);
-    let keepalive = Duration::from_secs(config.keep_alive_seconds.clamp(5, 300) as u64);
-    let ssh_config = Arc::new(Config {
-        keepalive_interval: Some(keepalive),
-        keepalive_max: 3,
-        nodelay: true,
-        ..Config::default()
-    });
+    let handles = dial_chain(context, tunnel).await?;
 
-    let hops = hop_chain(config);
-    let mut handles: Vec<Handle<ClientHandler>> = Vec::new();
-    let mut upstream: Option<Handle<ClientHandler>> = None;
-
-    for hop in &hops {
-        if hop.host.trim().is_empty() {
-            return Err(TunnelError::Connect("SSH 主机地址为空".into()));
-        }
-        let security_alert = Arc::new(AtomicBool::new(false));
-        let handler = ClientHandler::new(
-            &hop.host,
-            hop.port,
-            config.strict_host_key,
-            context.known_hosts.clone(),
-            security_alert.clone(),
-        );
-
-        let mut handle = match upstream.take() {
-            None => {
-                let result = timed(
-                    timeout,
-                    client::connect(ssh_config.clone(), (hop.host.as_str(), hop.port), handler),
-                )
-                .await;
-                match result {
-                    Ok(handle) => handle,
-                    Err(error) => {
-                        if security_alert.load(Ordering::SeqCst) {
-                            return Err(TunnelError::HostKeyChanged);
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            Some(parent) => {
-                let channel = match timed(
-                    timeout,
-                    parent.channel_open_direct_tcpip(
-                        hop.host.clone(),
-                        hop.port as u32,
-                        "127.0.0.1",
-                        0,
-                    ),
-                )
-                .await
-                {
-                    Ok(channel) => channel,
-                    Err(error) => {
-                        let _ = parent.disconnect(Disconnect::ByApplication, "", "").await;
-                        disconnect_handles(&handles).await;
-                        return Err(error);
-                    }
-                };
-                handles.push(parent);
-                let result = timed(
-                    timeout,
-                    client::connect_stream(ssh_config.clone(), channel.into_stream(), handler),
-                )
-                .await;
-                match result {
-                    Ok(handle) => handle,
-                    Err(error) => {
-                        if security_alert.load(Ordering::SeqCst) {
-                            disconnect_handles(&handles).await;
-                            return Err(TunnelError::HostKeyChanged);
-                        }
-                        disconnect_handles(&handles).await;
-                        return Err(error);
-                    }
-                }
-            }
-        };
-
-        if let Err(error) = authenticate(&mut handle, hop, context, timeout).await {
-            let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-            disconnect_handles(&handles).await;
-            return Err(error);
-        }
-        upstream = Some(handle);
-    }
-
-    let target = upstream.ok_or_else(|| TunnelError::Connect("没有可用的 SSH 连接".into()))?;
-    handles.push(target);
-
-    let listener = match TcpListener::bind((config.local_host.as_str(), config.local_port)).await {
+    let listener = match TcpListener::bind((forward.local_host.as_str(), forward.local_port)).await
+    {
         Ok(listener) => listener,
         Err(error) => {
             disconnect_handles(&handles).await;
@@ -420,11 +467,11 @@ pub async fn connect(
     let local_port = listener
         .local_addr()
         .map(|addr| addr.port())
-        .unwrap_or(config.local_port);
+        .unwrap_or(forward.local_port);
 
     let cancel = CancellationToken::new();
-    let remote_host = config.remote_host.clone();
-    let remote_port = config.remote_port;
+    let remote_host = forward.remote_host.clone();
+    let remote_port = forward.remote_port;
     let task = tokio::spawn(supervise(
         handles,
         listener,
@@ -434,9 +481,9 @@ pub async fn connect(
     ));
 
     tracing::info!(
-        local = %format!("{}:{}", config.local_host, local_port),
-        remote = %format!("{}:{}", config.remote_host, config.remote_port),
-        "隧道已建立"
+        local = %format!("{}:{}", forward.local_host, local_port),
+        remote = %format!("{}:{}", forward.remote_host, forward.remote_port),
+        "应用转发已建立"
     );
 
     Ok(SshTunnel {
@@ -509,7 +556,7 @@ async fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{JumpHost, SshCredentials};
+    use crate::model::JumpHost;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -532,6 +579,21 @@ mod tests {
         assert!(matches!(map_russh_error(timeout), TunnelError::Timeout));
     }
 
+    #[test]
+    fn forward_spec_comes_from_the_application_not_the_tunnel() {
+        let app = ForwardApp {
+            local_port: 18080,
+            remote_host: "10.0.0.5".into(),
+            remote_port: 5000,
+            ..ForwardApp::default()
+        };
+        let spec = ForwardSpec::from(&app);
+        assert_eq!(spec.local_port, 18080);
+        assert_eq!(spec.local_host, LOOPBACK);
+        assert_eq!(spec.remote_host, "10.0.0.5");
+        assert_eq!(spec.remote_port, 5000);
+    }
+
     /// Shared fixture for the sshd-backed tests. Everything (master key,
     /// known-hosts store, tunnel config) lives in a temp dir so runs do not
     /// touch the real application data.
@@ -539,7 +601,8 @@ mod tests {
         dir: tempfile::TempDir,
         secrets: Arc<Secrets>,
         known_hosts: Arc<KnownHosts>,
-        config: TunnelConfig,
+        tunnel: TunnelConfig,
+        forward: ForwardSpec,
     }
 
     impl E2e {
@@ -562,11 +625,8 @@ mod tests {
                     ..SshCredentials::default()
                 },
             };
-            let config = TunnelConfig {
+            let tunnel = TunnelConfig {
                 name: "e2e".into(),
-                local_port: 0,
-                remote_host: env_or("TD_E2E_REMOTE_HOST", "127.0.0.1"),
-                remote_port: env_or("TD_E2E_REMOTE_PORT", "8080").parse().unwrap(),
                 ssh_host: host,
                 ssh_port: port,
                 ssh_user: user,
@@ -575,11 +635,18 @@ mod tests {
                 connect_timeout_seconds: 10,
                 ..TunnelConfig::default()
             };
+            let forward = ForwardSpec {
+                local_host: LOOPBACK.to_string(),
+                local_port: 0,
+                remote_host: env_or("TD_E2E_REMOTE_HOST", "127.0.0.1"),
+                remote_port: env_or("TD_E2E_REMOTE_PORT", "8080").parse().unwrap(),
+            };
             Self {
                 dir,
                 secrets,
                 known_hosts,
-                config,
+                tunnel,
+                forward,
             }
         }
 
@@ -591,7 +658,7 @@ mod tests {
         }
 
         fn host_key(&self) -> String {
-            format!("{}:{}", self.config.ssh_host, self.config.ssh_port)
+            format!("{}:{}", self.tunnel.ssh_host, self.tunnel.ssh_port)
         }
     }
 
@@ -619,23 +686,35 @@ mod tests {
         ))
         .unwrap();
         let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
-        let mut config = setup.config.clone();
+        let mut tunnel = setup.tunnel.clone();
         if std::env::var("TD_E2E_WITH_JUMP").is_ok() {
-            config.jumps = vec![JumpHost {
-                host: config.ssh_host.clone(),
-                port: config.ssh_port,
-                username: config.ssh_user.clone(),
-                credentials: config.credentials.clone(),
+            tunnel.jumps = vec![JumpHost {
+                host: tunnel.ssh_host.clone(),
+                port: tunnel.ssh_port,
+                username: tunnel.ssh_user.clone(),
+                credentials: tunnel.credentials.clone(),
                 ..JumpHost::default()
             }];
         }
 
-        let mut tunnel = connect(&setup.context(), &config)
+        let mut tunnel = connect(&setup.context(), &tunnel, &setup.forward)
             .await
             .expect("tunnel connects");
         assert!(tunnel.local_port() > 0);
         assert_http_forwarded(tunnel.local_port()).await;
         tunnel.close().await;
+    }
+
+    /// The probe authenticates through the chain but never binds a local port.
+    #[tokio::test]
+    #[ignore = "requires a local sshd"]
+    async fn e2e_probe_authenticates_without_forward() {
+        let private_key =
+            std::fs::read_to_string(env_required("TD_E2E_KEY", "private key")).unwrap();
+        let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
+        probe(&setup.context(), &setup.tunnel)
+            .await
+            .expect("probe authenticates");
     }
 
     /// A pinned host key that no longer matches must abort the connection and
@@ -646,7 +725,7 @@ mod tests {
         let private_key =
             std::fs::read_to_string(env_required("TD_E2E_KEY", "private key")).unwrap();
         let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
-        let mut tunnel = connect(&setup.context(), &setup.config)
+        let mut tunnel = connect(&setup.context(), &setup.tunnel, &setup.forward)
             .await
             .expect("first connect pins the key");
         tunnel.close().await;
@@ -673,7 +752,7 @@ mod tests {
             secrets: setup.secrets.clone(),
             known_hosts,
         };
-        let error = connect(&context, &setup.config)
+        let error = connect(&context, &setup.tunnel, &setup.forward)
             .await
             .expect_err("changed host key must be refused");
         assert!(
@@ -693,10 +772,10 @@ mod tests {
             .await
             .unwrap();
         let port = occupied.local_addr().unwrap().port();
-        let mut config = setup.config.clone();
-        config.local_port = port;
+        let mut forward = setup.forward.clone();
+        forward.local_port = port;
 
-        let error = connect(&setup.context(), &config)
+        let error = connect(&setup.context(), &setup.tunnel, &forward)
             .await
             .expect_err("bound local port must be refused");
         assert!(
@@ -714,7 +793,7 @@ mod tests {
         ))
         .unwrap();
         let setup = E2e::new(AuthType::PrivateKey, &unauthorized).await;
-        let error = connect(&setup.context(), &setup.config)
+        let error = connect(&setup.context(), &setup.tunnel, &setup.forward)
             .await
             .expect_err("unauthorized key must fail");
         assert!(
@@ -729,7 +808,7 @@ mod tests {
     async fn e2e_password_auth() {
         let password = env_required("TD_E2E_PASSWORD", "test account password");
         let setup = E2e::new(AuthType::Password, &password).await;
-        let mut tunnel = connect(&setup.context(), &setup.config)
+        let mut tunnel = connect(&setup.context(), &setup.tunnel, &setup.forward)
             .await
             .expect("password auth connects");
         assert_http_forwarded(tunnel.local_port()).await;
