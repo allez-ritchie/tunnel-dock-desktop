@@ -61,9 +61,23 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | null = null;
+    // Events that arrive while the initial snapshot is in flight must not be
+    // lost, otherwise a tunnel connecting during startup stays "connecting".
+    const pending = new Map<string, TunnelStatus>();
 
     void (async () => {
       try {
+        // Subscribe first, then read the snapshot, so no transition can fall
+        // into the gap between the two calls.
+        unlisten = await onTunnelStatus((status) => {
+          pending.set(status.tunnelId, status);
+          setStatuses((current) => ({ ...current, [status.tunnelId]: status }));
+        });
+        if (disposed) {
+          unlisten();
+          return;
+        }
+
         const [list, currentStatuses, appVersion] = await Promise.all([
           api.listTunnels(),
           api.listStatuses(),
@@ -72,14 +86,19 @@ export default function App() {
         if (disposed) return;
         setTunnels(list);
         setVersion(appVersion);
-        setStatuses(
-          Object.fromEntries(currentStatuses.map((status) => [status.tunnelId, status])),
-        );
-        void refreshKnownHosts();
-        unlisten = await onTunnelStatus((status) => {
-          setStatuses((current) => ({ ...current, [status.tunnelId]: status }));
+        setStatuses(() => {
+          const merged: StatusMap = Object.fromEntries(
+            currentStatuses.map((status) => [status.tunnelId, status]),
+          );
+          for (const [id, status] of pending) {
+            const snapshot = merged[id];
+            if (!snapshot || status.updatedAt >= snapshot.updatedAt) {
+              merged[id] = status;
+            }
+          }
+          return merged;
         });
-        if (disposed) unlisten();
+        void refreshKnownHosts();
       } catch (error) {
         if (!disposed) notify(errorMessage(error));
       }
