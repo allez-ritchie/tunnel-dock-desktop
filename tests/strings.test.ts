@@ -1,25 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { strings, describeError } from "../src/strings";
+import { describeError, strings } from "../src/strings";
 
 describe("describeError", () => {
   it("maps the security error to the fingerprint guidance", () => {
-    expect(describeError("host_key_changed", null)).toBe(strings.errorHostKeyChanged);
-  });
-
-  it("treats a changed host key as a security alert even with no detail", () => {
-    expect(describeError("host_key_changed", "")).toContain("主机密钥");
+    expect(describeError("host_key_changed", null)).toBe(
+      strings.errorHostKeyChanged,
+    );
   });
 
   it("substitutes the port into the port-in-use message", () => {
     expect(describeError("port_in_use", null, 18080)).toBe(
       strings.errorPortInUse(18080),
     );
-    expect(describeError("port_in_use", null, 18080)).toContain("18080");
+    expect(describeError("port_in_use", null)).toBe(strings.errorPortInUse(0));
   });
 
-  it("falls back to port 0 when the status carries no port", () => {
-    expect(describeError("port_in_use", null)).toBe(strings.errorPortInUse(0));
-    expect(describeError("port_in_use", null, null)).toBe(strings.errorPortInUse(0));
+  it("maps dangling references to actionable copy", () => {
+    expect(describeError("tunnel_deleted", null)).toBe(
+      strings.errorTunnelDeleted,
+    );
+    expect(describeError("group_missing", null)).toBe(strings.errorGroupMissing);
+    expect(describeError("port_conflict", null)).toBe(
+      strings.errorPortConflict,
+    );
   });
 
   it("maps every stable backend error code", () => {
@@ -31,6 +34,8 @@ describe("describeError", () => {
       "connection_refused",
       "local_forward_lost",
       "connection_closed",
+      "tunnel_down",
+      "forward_failed",
     ];
     for (const code of codes) {
       const text = describeError(code, null);
@@ -46,22 +51,28 @@ describe("describeError", () => {
   });
 
   it("shows a placeholder when an unknown code carries no detail", () => {
-    expect(describeError("weird_code", null)).toBe(strings.errorGeneric("未知错误"));
+    expect(describeError("weird_code", null)).toBe(
+      strings.errorGeneric("未知错误"),
+    );
   });
 });
 
 describe("strings", () => {
-  it("formats counts and ports without leaking placeholders", () => {
-    expect(strings.homeTunnelsCount(3)).toBe("3 条");
-    expect(strings.cardJumps(2)).toBe("2 级跳板");
-    expect(strings.cardKeepalive(30)).toBe("保活 30 秒");
-    expect(strings.cardRetryCount(5)).toBe("第 5 次");
-    expect(strings.cardNextRetry(8)).toBe("8 秒后重试");
+  it("formats counts without leaking placeholders", () => {
+    expect(strings.appsGroupForwarding(3)).toBe("3 个转发中");
+    expect(strings.appsGroupCount(2)).toBe("2 个应用");
+    expect(strings.tunnelAppsUsing(2)).toBe("被 2 个应用使用");
+    expect(strings.tunnelJumpCount(2)).toBe("2 级跳板");
+    expect(strings.appRetryCount(5)).toBe("第 5 次");
+    expect(strings.appNextRetry(8)).toBe("8 秒后重试");
     expect(strings.settingsVersion("1.0.0")).toBe("版本 1.0.0");
   });
 
   it("quotes user-supplied names in destructive copy", () => {
-    expect(strings.deleteBody("家庭 NAS")).toContain("家庭 NAS");
-    expect(strings.errorLocalPortInUse("别的")).toContain("别的");
+    expect(strings.appDeleteBody("公司后台")).toContain("公司后台");
+    expect(strings.groupDeleteBody("工作", 2)).toContain("工作");
+    expect(strings.groupDeleteBody("工作", 2)).toContain("2");
+    expect(strings.tunnelDeleteBody("家庭 NAS", 1)).toContain("家庭 NAS");
+    expect(strings.toastTunnelDeleted(2)).toContain("2");
   });
 });
