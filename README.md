@@ -117,23 +117,61 @@ src-tauri/src/
 
 ## 测试
 
+三层测试，全部可离线运行（端到端层需要一个本机 sshd）。
+
+### 1. 前端单元测试
+
+```bash
+npm test          # vitest run
+```
+
+覆盖 `src/draft.ts` 的表单校验、端口推导、凭据“留空保持 / 空串清除 / 新值替换”
+语义、跳板序列化，以及 `src/strings.ts` 的错误码映射。纯逻辑、无需浏览器。
+
+### 2. Rust 单元与集成测试
+
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-包含模型、持久化、凭据加解密、TOFU 主机密钥与重连退避的单元测试。
+包含模型、持久化、凭据加解密、TOFU 主机密钥、重连退避，以及
+`commands.rs` 的入参校验（端口范围、跳板数量上限、本地监听必须为回环地址、
+凭据密文保留语义）。
 
-端到端转发测试（需要本机 sshd 与 HTTP 服务）：
+### 3. 端到端隧道测试（忽略标记，需真实 sshd）
+
+这些用例在 `ssh.rs` 里带 `#[ignore]`，默认不跑。先准备一台测试 sshd：
 
 ```bash
-# 假设 sshd 监听 127.0.0.1:2222（公钥登录），HTTP 服务监听 127.0.0.1:8080
-TD_E2E_KEY=/path/to/id_ed25519 \
-  cargo test --manifest-path src-tauri/Cargo.toml e2e_forward -- --ignored
+# 公钥登录的 sshd（端口 2222）与 HTTP 服务（端口 8080）
+TD_E2E_KEY=~/.ssh/id_ed25519 \
+  cargo test --manifest-path src-tauri/Cargo.toml --lib e2e_forward -- --ignored
 
-# 追加多级跳板验证
-TD_E2E_KEY=/path/to/id_ed25519 TD_E2E_WITH_JUMP=1 \
-  cargo test --manifest-path src-tauri/Cargo.toml e2e_forward -- --ignored
+# 多级跳板
+TD_E2E_KEY=~/.ssh/id_ed25519 TD_E2E_WITH_JUMP=1 \
+  cargo test --manifest-path src-tauri/Cargo.toml --lib e2e_forward -- --ignored
+
+# 主机密钥变更必须被拒（会临时改写临时目录里的 known_hosts.json）
+TD_E2E_KEY=~/.ssh/id_ed25519 \
+  cargo test --manifest-path src-tauri/Cargo.toml --lib e2e_rejects_changed_host_key -- --ignored
+
+# 认证失败 / 本地端口被占用
+TD_E2E_KEY=~/.ssh/id_ed25519 TD_E2E_BAD_KEY=~/.ssh/unauthorized_key \
+  cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored \
+  --skip e2e_password_auth --test-threads=1
 ```
+
+密码认证需要一台允许 `PasswordAuthentication` 且 `AllowTcpForwarding yes` 的 sshd：
+
+```bash
+TD_E2E_HOST=127.0.0.1 TD_E2E_PORT=2222 TD_E2E_USER=test \
+TD_E2E_PASSWORD=... TD_E2E_REMOTE_HOST=127.0.0.1 TD_E2E_REMOTE_PORT=8080 \
+  cargo test --manifest-path src-tauri/Cargo.toml --lib e2e_password_auth -- --ignored
+```
+
+可用环境变量：`TD_E2E_HOST`、`TD_E2E_PORT`、`TD_E2E_USER`、`TD_E2E_KEY`、
+`TD_E2E_BAD_KEY`、`TD_E2E_PASSWORD`、`TD_E2E_REMOTE_HOST`、`TD_E2E_REMOTE_PORT`、
+`TD_E2E_EXPECT`（默认 `TUNNELDOCK_E2E_MARKER_42`）、`TD_E2E_WITH_JUMP`。
 
 ## 与 Android 版的差异
 

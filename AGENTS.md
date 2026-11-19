@@ -63,11 +63,18 @@ npm install
 # 前端类型检查 + 生产构建（最快的 UI 回归）
 npm run build
 
+# 前端逻辑单元测试（draft 表单校验 / 凭据语义 / 错误码映射）
+npm test
+
 # Rust 编译检查（最快的后端语法/类型检查）
 cargo check --manifest-path src-tauri/Cargo.toml
 
-# Rust 单元测试（模型、重连退避、密文格式）
+# Rust 单元 + 集成测试（模型、重连退避、密文格式、命令入参校验）
 cargo test --manifest-path src-tauri/Cargo.toml
+
+# 端到端隧道测试（带 #[ignore]，需要本机 sshd 与 HTTP 服务，见 README「测试」）
+TD_E2E_KEY=/path/to/key cargo test --manifest-path src-tauri/Cargo.toml \
+  --lib -- --ignored
 
 # 开发运行（需要图形桌面环境）
 npm run tauri dev
