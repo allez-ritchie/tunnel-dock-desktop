@@ -1,5 +1,8 @@
 import type {
+  AppInput,
+  AppView,
   AuthType,
+  GroupView,
   JumpInput,
   JumpView,
   TunnelInput,
@@ -28,9 +31,6 @@ export interface JumpForm {
 export interface TunnelForm {
   id: string | null;
   name: string;
-  localPort: string;
-  remoteHost: string;
-  remotePort: string;
   sshHost: string;
   sshPort: string;
   sshUser: string;
@@ -46,17 +46,27 @@ export interface TunnelForm {
   hasPassphrase: boolean;
   jumps: JumpForm[];
   autoReconnect: boolean;
-  autoStartOnBoot: boolean;
   strictHostKey: boolean;
   keepAliveSeconds: string;
   connectTimeoutSeconds: string;
+}
+
+export interface AppForm {
+  id: string | null;
+  name: string;
+  groupId: string;
+  tunnelId: string;
+  localPort: string;
+  remoteHost: string;
+  remotePort: string;
   browserUrl: string;
+  autoStartOnBoot: boolean;
 }
 
 export const MAX_JUMPS = 8;
 
-export function nextPort(tunnels: TunnelView[]): number {
-  const used = new Set(tunnels.map((tunnel) => tunnel.localPort));
+export function nextPort(apps: AppView[]): number {
+  const used = new Set(apps.map((app) => app.localPort));
   for (let port = 18080; port <= 65535; port += 1) {
     if (!used.has(port)) return port;
   }
@@ -83,13 +93,10 @@ export function jumpFormFrom(jump?: JumpView): JumpForm {
   };
 }
 
-export function formFrom(tunnel?: TunnelView, suggestedPort = 18080): TunnelForm {
+export function tunnelFormFrom(tunnel?: TunnelView): TunnelForm {
   return {
     id: tunnel?.id ?? null,
     name: tunnel?.name ?? "",
-    localPort: String(tunnel?.localPort ?? suggestedPort),
-    remoteHost: tunnel?.remoteHost ?? "127.0.0.1",
-    remotePort: String(tunnel?.remotePort ?? 80),
     sshHost: tunnel?.sshHost ?? "",
     sshPort: String(tunnel?.sshPort ?? 22),
     sshUser: tunnel?.sshUser ?? "root",
@@ -105,15 +112,30 @@ export function formFrom(tunnel?: TunnelView, suggestedPort = 18080): TunnelForm
     hasPassphrase: tunnel?.credentials.hasPassphrase ?? false,
     jumps: tunnel?.jumps.map((jump) => jumpFormFrom(jump)) ?? [],
     autoReconnect: tunnel?.autoReconnect ?? true,
-    autoStartOnBoot: tunnel?.autoStartOnBoot ?? false,
     strictHostKey: tunnel?.strictHostKey ?? true,
     keepAliveSeconds: String(tunnel?.keepAliveSeconds ?? 30),
     connectTimeoutSeconds: String(tunnel?.connectTimeoutSeconds ?? 15),
-    browserUrl: tunnel?.browserUrl ?? "",
   };
 }
 
-export function signature(form: TunnelForm): string {
+export function appFormFrom(
+  app?: AppView,
+  defaults?: { groupId?: string; tunnelId?: string; localPort?: number },
+): AppForm {
+  return {
+    id: app?.id ?? null,
+    name: app?.name ?? "",
+    groupId: app?.groupId ?? defaults?.groupId ?? "default",
+    tunnelId: app?.tunnelId ?? defaults?.tunnelId ?? "",
+    localPort: String(app?.localPort ?? defaults?.localPort ?? 18080),
+    remoteHost: app?.remoteHost ?? "127.0.0.1",
+    remotePort: String(app?.remotePort ?? 80),
+    browserUrl: app?.browserUrl ?? "",
+    autoStartOnBoot: app?.autoStartOnBoot ?? false,
+  };
+}
+
+export function signature(form: TunnelForm | AppForm): string {
   return JSON.stringify(form);
 }
 
@@ -158,29 +180,12 @@ export function jumpError(jump: JumpForm): string | null {
   return null;
 }
 
-export function validate(form: TunnelForm, others: TunnelView[]): FormErrors {
+export function validateTunnel(form: TunnelForm): FormErrors {
   const errors: FormErrors = {};
   const name = form.name.trim();
   if (name === "") errors.name = strings.errorNameRequired;
   else if ([...name].length > 40) errors.name = strings.errorNameTooLong;
 
-  const localPort = parsePort(form.localPort);
-  if (localPort === null || localPort < 1024 || localPort > 65535) {
-    errors.localPort = strings.errorLocalPort;
-  } else {
-    const conflict = others.find(
-      (tunnel) => tunnel.id !== form.id && tunnel.localPort === localPort,
-    );
-    if (conflict) errors.localPort = strings.errorLocalPortInUse(conflict.name);
-  }
-
-  if (form.remoteHost.trim() === "" || /\s/.test(form.remoteHost)) {
-    errors.remoteHost = strings.errorRemoteHostRequired;
-  }
-  const remotePort = parsePort(form.remotePort);
-  if (remotePort === null || remotePort < 1 || remotePort > 65535) {
-    errors.remotePort = strings.errorRemotePort;
-  }
   if (form.sshHost.trim() === "" || /\s/.test(form.sshHost)) {
     errors.sshHost = strings.errorSshHostRequired;
   }
@@ -207,6 +212,45 @@ export function validate(form: TunnelForm, others: TunnelView[]): FormErrors {
     errors.connectTimeoutSeconds = strings.errorTimeout;
   }
 
+  if (form.jumps.length > MAX_JUMPS) {
+    errors.jumps = strings.errorMaxJumps;
+  } else if (form.jumps.some((jump) => jumpError(jump) !== null)) {
+    errors.jumps = strings.errorJumpInvalid;
+  }
+
+  return errors;
+}
+
+export function validateApp(
+  form: AppForm,
+  groups: GroupView[],
+  tunnels: TunnelView[],
+): FormErrors {
+  const errors: FormErrors = {};
+  const name = form.name.trim();
+  if (name === "") errors.name = strings.errorAppNameRequired;
+  else if ([...name].length > 40) errors.name = strings.errorAppNameTooLong;
+
+  if (!groups.some((group) => group.id === form.groupId)) {
+    errors.groupId = strings.errorGroupRequired;
+  }
+  if (!tunnels.some((tunnel) => tunnel.id === form.tunnelId)) {
+    errors.tunnelId = strings.errorTunnelRequired;
+  }
+
+  const localPort = parsePort(form.localPort);
+  if (localPort === null || localPort < 1024 || localPort > 65535) {
+    errors.localPort = strings.errorLocalPort;
+  }
+
+  if (form.remoteHost.trim() === "" || /\s/.test(form.remoteHost)) {
+    errors.remoteHost = strings.errorRemoteHostRequired;
+  }
+  const remotePort = parsePort(form.remotePort);
+  if (remotePort === null || remotePort < 1 || remotePort > 65535) {
+    errors.remotePort = strings.errorRemotePort;
+  }
+
   const browserUrl = form.browserUrl.trim();
   if (
     browserUrl !== "" &&
@@ -214,12 +258,6 @@ export function validate(form: TunnelForm, others: TunnelView[]): FormErrors {
     !browserUrl.toLowerCase().startsWith("https://")
   ) {
     errors.browserUrl = strings.errorBrowserUrl;
-  }
-
-  if (form.jumps.length > MAX_JUMPS) {
-    errors.jumps = strings.errorMaxJumps;
-  } else if (form.jumps.some((jump) => jumpError(jump) !== null)) {
-    errors.jumps = strings.errorJumpInvalid;
   }
 
   return errors;
@@ -253,14 +291,10 @@ export function toJumpInput(jump: JumpForm): JumpInput {
   };
 }
 
-export function toInput(form: TunnelForm): TunnelInput {
+export function toTunnelInput(form: TunnelForm): TunnelInput {
   return {
     id: form.id,
     name: form.name.trim(),
-    localHost: "127.0.0.1",
-    localPort: Number(form.localPort),
-    remoteHost: form.remoteHost.trim(),
-    remotePort: Number(form.remotePort),
     sshHost: form.sshHost.trim(),
     sshPort: Number(form.sshPort),
     sshUser: form.sshUser.trim(),
@@ -284,11 +318,23 @@ export function toInput(form: TunnelForm): TunnelInput {
     },
     jumps: form.jumps.map(toJumpInput),
     autoReconnect: form.autoReconnect,
-    autoStartOnBoot: form.autoStartOnBoot,
     keepAliveSeconds: Number(form.keepAliveSeconds),
     connectTimeoutSeconds: Number(form.connectTimeoutSeconds),
     strictHostKey: form.strictHostKey,
+  };
+}
+
+export function toAppInput(form: AppForm): AppInput {
+  return {
+    id: form.id,
+    name: form.name.trim(),
+    groupId: form.groupId,
+    tunnelId: form.tunnelId,
+    localPort: Number(form.localPort),
+    remoteHost: form.remoteHost.trim(),
+    remotePort: Number(form.remotePort),
     browserUrl: form.browserUrl.trim(),
+    autoStartOnBoot: form.autoStartOnBoot,
   };
 }
 

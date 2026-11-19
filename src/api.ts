@@ -7,8 +7,17 @@ export type TunnelPhase =
   | "connecting"
   | "connected"
   | "reconnecting"
-  | "error"
-  | "stopping";
+  | "error";
+
+export type AppBlockReason =
+  | "none"
+  | "tunnel_deleted"
+  | "group_missing"
+  | "tunnel_down"
+  | "forward_failed"
+  | "port_conflict";
+
+export type TestState = "success" | "failure";
 
 export interface CredentialState {
   authType: AuthType;
@@ -26,35 +35,54 @@ export interface JumpView {
   credentials: CredentialState;
 }
 
+/** Reusable SSH access definition. Holds no local port and no remote target. */
 export interface TunnelView {
   id: string;
   name: string;
-  localHost: string;
-  localPort: number;
-  remoteHost: string;
-  remotePort: number;
   sshHost: string;
   sshPort: number;
   sshUser: string;
   credentials: CredentialState;
   jumps: JumpView[];
   autoReconnect: boolean;
-  autoStartOnBoot: boolean;
   keepAliveSeconds: number;
   connectTimeoutSeconds: number;
   strictHostKey: boolean;
-  browserUrl: string;
-  desiredOn: boolean;
   createdAt: number;
   updatedAt: number;
-  localUrl: string;
-  browserOpenUrl: string;
+  endpoint: string;
   chainSummary: string;
 }
 
-export interface TunnelStatus {
+/** One `localPort -> remoteHost:remotePort` forwarding rule. */
+export interface AppView {
+  id: string;
+  name: string;
+  groupId: string;
   tunnelId: string;
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
+  browserUrl: string;
+  browserOpenUrl: string;
+  localUrl: string;
+  autoStartOnBoot: boolean;
+  desiredOn: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface GroupView {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  createdAt: number;
+}
+
+export interface AppStatus {
+  appId: string;
   phase: TunnelPhase;
+  blockReason: AppBlockReason;
   attempt: number;
   nextRetrySeconds: number | null;
   connectedAt: number | null;
@@ -63,6 +91,22 @@ export interface TunnelStatus {
   errorDetail: string | null;
   securityAlert: boolean;
   updatedAt: number;
+}
+
+export interface TunnelTestResult {
+  tunnelId: string;
+  state: TestState;
+  elapsedMs: number;
+  errorCode: string | null;
+  errorDetail: string | null;
+  securityAlert: boolean;
+}
+
+export interface DockView {
+  tunnels: TunnelView[];
+  apps: AppView[];
+  groups: GroupView[];
+  statuses: AppStatus[];
 }
 
 export interface CredentialInput {
@@ -85,43 +129,58 @@ export interface JumpInput {
 export interface TunnelInput {
   id: string | null;
   name: string;
-  localHost: string;
-  localPort: number;
-  remoteHost: string;
-  remotePort: number;
   sshHost: string;
   sshPort: number;
   sshUser: string;
   credentials: CredentialInput;
   jumps: JumpInput[];
   autoReconnect: boolean;
-  autoStartOnBoot: boolean;
   keepAliveSeconds: number;
   connectTimeoutSeconds: number;
   strictHostKey: boolean;
+}
+
+export interface AppInput {
+  id: string | null;
+  name: string;
+  groupId: string;
+  tunnelId: string;
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
   browserUrl: string;
+  autoStartOnBoot: boolean;
+}
+
+export interface GroupInput {
+  id: string | null;
+  name: string;
 }
 
 export const api = {
-  listTunnels: () => invoke<TunnelView[]>("list_tunnels"),
-  listStatuses: () => invoke<TunnelStatus[]>("list_statuses"),
+  loadDock: () => invoke<DockView>("load_dock"),
   saveTunnel: (input: TunnelInput) => invoke<TunnelView>("save_tunnel", { input }),
   deleteTunnel: (id: string) => invoke<void>("delete_tunnel", { id }),
-  connectTunnel: (id: string) => invoke<void>("connect_tunnel", { id }),
-  connectAll: () => invoke<void>("connect_all"),
-  disconnectTunnel: (id: string) => invoke<void>("disconnect_tunnel", { id }),
-  disconnectAll: () => invoke<void>("disconnect_all"),
-  reconnectTunnel: (id: string) => invoke<void>("reconnect_tunnel", { id }),
+  testTunnel: (id: string) => invoke<TunnelTestResult>("test_tunnel", { id }),
+  saveApp: (input: AppInput) => invoke<AppView>("save_app", { input }),
+  deleteApp: (id: string) => invoke<void>("delete_app", { id }),
+  startApp: (id: string) => invoke<void>("start_app", { id }),
+  stopApp: (id: string) => invoke<void>("stop_app", { id }),
+  restartApp: (id: string) => invoke<void>("restart_app", { id }),
+  startGroup: (groupId: string) => invoke<void>("start_group", { groupId }),
+  stopGroup: (groupId: string) => invoke<void>("stop_group", { groupId }),
+  saveGroup: (input: GroupInput) => invoke<GroupView>("save_group", { input }),
+  deleteGroup: (id: string) => invoke<void>("delete_group", { id }),
   knownHostsCount: () => invoke<number>("known_hosts_count"),
   clearKnownHosts: () => invoke<void>("clear_known_hosts"),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   appVersion: () => invoke<string>("app_version"),
 };
 
-export function onTunnelStatus(
-  callback: (status: TunnelStatus) => void,
+export function onAppStatus(
+  callback: (status: AppStatus) => void,
 ): Promise<UnlistenFn> {
-  return listen<TunnelStatus>("tunnel-status", (event) => callback(event.payload));
+  return listen<AppStatus>("app-status", (event) => callback(event.payload));
 }
 
 export function errorMessage(error: unknown): string {

@@ -143,6 +143,43 @@ const paths: Record<string, ReactNode> = {
       <path d="M14 10l3-3 3 3" />
     </>
   ),
+  apps: (
+    <>
+      <rect x="3" y="3" width="7" height="7" rx="2" />
+      <rect x="14" y="3" width="7" height="7" rx="2" />
+      <rect x="3" y="14" width="7" height="7" rx="2" />
+      <rect x="14" y="14" width="7" height="7" rx="2" />
+    </>
+  ),
+  folder: (
+    <>
+      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+    </>
+  ),
+  pulse: (
+    <>
+      <path d="M3 12h4l2.5-7 4 14L16 12h5" />
+    </>
+  ),
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3.5 2" />
+    </>
+  ),
+  link: (
+    <>
+      <path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.2" />
+      <path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.2" />
+    </>
+  ),
+  trashCan: (
+    <>
+      <path d="M3 6h18" />
+      <path d="M8 6V4h8v2" />
+      <path d="M6 6l1 14h10l1-14" />
+    </>
+  ),
 };
 
 export function Icon({
@@ -205,15 +242,15 @@ export function phaseColor(phase: TunnelPhase): string {
 export function phaseLabel(phase: TunnelPhase): string {
   switch (phase) {
     case "connected":
-      return strings.cardPhaseConnected;
+      return strings.appPhaseConnected;
     case "connecting":
-      return strings.cardPhaseConnecting;
+      return strings.appPhaseConnecting;
     case "reconnecting":
-      return strings.cardPhaseReconnecting;
+      return strings.appPhaseReconnecting;
     case "error":
-      return strings.cardPhaseError;
+      return strings.appPhaseError;
     default:
-      return strings.cardPhaseStopped;
+      return strings.appPhaseIdle;
   }
 }
 
@@ -316,6 +353,38 @@ export function SecureNotice({ text }: { text: string }) {
   );
 }
 
+export type NavTab = "apps" | "tunnels" | "settings";
+
+export function BottomNav({
+  tab,
+  onChange,
+}: {
+  tab: NavTab;
+  onChange: (tab: NavTab) => void;
+}) {
+  const items: { value: NavTab; label: string; icon: keyof typeof paths }[] = [
+    { value: "apps", label: strings.tabApps, icon: "apps" },
+    { value: "tunnels", label: strings.tabTunnels, icon: "route" },
+    { value: "settings", label: strings.tabSettings, icon: "settings" },
+  ];
+  return (
+    <nav className="bottom-nav" aria-label={strings.appName}>
+      {items.map((item) => (
+        <button
+          key={item.value}
+          type="button"
+          className={`bottom-nav-item${tab === item.value ? " is-active" : ""}`}
+          aria-current={tab === item.value ? "page" : undefined}
+          onClick={() => onChange(item.value)}
+        >
+          <Icon name={item.icon} size={20} />
+          <span>{item.label}</span>
+        </button>
+      ))}
+    </nav>
+  );
+}
+
 export function ConfirmDialog({
   title,
   body,
@@ -324,7 +393,7 @@ export function ConfirmDialog({
   onCancel,
 }: {
   title: string;
-  body: string;
+  body: ReactNode;
   confirmLabel: string;
   onConfirm: () => void;
   onCancel: () => void;
