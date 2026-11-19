@@ -45,11 +45,7 @@ pub async fn save_tunnel(
         .await
         .map_err(|error| error.to_string())?;
     if restart {
-        state
-            .runtime
-            .reconnect(&saved.id)
-            .await
-            .map_err(|error| error)?;
+        state.runtime.reconnect(&saved.id).await?;
     }
     crate::sync_autostart(&app).await;
     Ok(TunnelView::from(&saved))
