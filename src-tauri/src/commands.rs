@@ -107,7 +107,8 @@ pub async fn clear_known_hosts(state: State<'_, AppState>) -> Result<(), String>
 #[tauri::command]
 pub fn open_url(url: String) -> Result<(), String> {
     let trimmed = url.trim();
-    let valid = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+    let lower = trimmed.to_ascii_lowercase();
+    let valid = lower.starts_with("http://") || lower.starts_with("https://");
     if !valid {
         return Err("仅支持打开 http:// 或 https:// 地址".into());
     }
@@ -117,6 +118,21 @@ pub fn open_url(url: String) -> Result<(), String> {
 #[tauri::command]
 pub fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Only loopback listeners are allowed: the UI never offers another address,
+/// and a hand-edited `tunnels.json` must not turn the forward into a LAN
+/// service. `localhost` and the whole 127.0.0.0/8 block count as loopback.
+fn is_loopback_host(host: &str) -> bool {
+    let trimmed = host.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match trimmed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 fn merge_secret(
@@ -214,6 +230,12 @@ fn build_config(
     if input.remote_host.trim().is_empty() || input.remote_host.contains(char::is_whitespace) {
         return Err("请填写远程主机".into());
     }
+    // The product only ever exposes the forward on loopback. Reject anything
+    // else so a hand-edited config cannot publish the tunnel to the LAN.
+    let local_host = input.local_host.trim();
+    if !local_host.is_empty() && !is_loopback_host(local_host) {
+        return Err("本地监听地址仅支持回环地址（127.0.0.1）".into());
+    }
     if input.remote_port == 0 {
         return Err("远程端口需在 1–65535 之间".into());
     }
@@ -233,9 +255,10 @@ fn build_config(
         return Err("连接超时需在 5–120 秒之间".into());
     }
     let browser_url = input.browser_url.trim().to_string();
+    let browser_url_lower = browser_url.to_ascii_lowercase();
     if !browser_url.is_empty()
-        && !browser_url.starts_with("http://")
-        && !browser_url.starts_with("https://")
+        && !browser_url_lower.starts_with("http://")
+        && !browser_url_lower.starts_with("https://")
     {
         return Err("地址需以 http:// 或 https:// 开头".into());
     }
@@ -304,4 +327,181 @@ fn build_config(
         ));
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::JumpInput;
+
+    fn input() -> TunnelInput {
+        TunnelInput {
+            id: None,
+            name: "NAS".into(),
+            local_host: LOOPBACK.into(),
+            local_port: 18080,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 80,
+            ssh_host: "example.com".into(),
+            ssh_port: 22,
+            ssh_user: "ops".into(),
+            credentials: CredentialInput {
+                password: Some("s3cret".into()),
+                ..CredentialInput::default()
+            },
+            jumps: Vec::new(),
+            auto_reconnect: true,
+            auto_start_on_boot: false,
+            keep_alive_seconds: DEFAULT_KEEPALIVE_SECONDS,
+            connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            strict_host_key: true,
+            browser_url: String::new(),
+        }
+    }
+
+    fn jump(index: usize) -> JumpInput {
+        JumpInput {
+            id: None,
+            label: format!("jump-{index}"),
+            host: "bastion".into(),
+            port: 22,
+            username: "ops".into(),
+            credentials: CredentialInput {
+                password: Some("s3cret".into()),
+                ..CredentialInput::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_config_and_encrypts_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let config = build_config(input(), None, &vault).unwrap();
+        assert_eq!(config.name, "NAS");
+        assert_eq!(config.local_host, LOOPBACK);
+        let cipher = config.credentials.password_cipher.unwrap();
+        assert_eq!(vault.decrypt(&cipher).unwrap(), "s3cret");
+    }
+
+    #[test]
+    fn loopback_detection_accepts_only_local_addresses() {
+        for host in ["127.0.0.1", "127.0.0.53", "localhost", "LOCALHOST", "::1"] {
+            assert!(is_loopback_host(host), "{host} should be loopback");
+        }
+        for host in ["0.0.0.0", "192.168.1.10", "example.com", "::", "10.0.0.1"] {
+            assert!(!is_loopback_host(host), "{host} must not be loopback");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_non_loopback_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        for host in ["0.0.0.0", "192.168.1.10"] {
+            let mut candidate = input();
+            candidate.local_host = host.into();
+            let error = build_config(candidate, None, &vault).unwrap_err();
+            assert!(error.contains("回环"), "{host}: unexpected error {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_localhost_and_blank_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut candidate = input();
+        candidate.local_host = "localhost".into();
+        assert!(build_config(candidate, None, &vault).is_ok());
+
+        let mut blank = input();
+        blank.local_host = "   ".into();
+        let config = build_config(blank, None, &vault).unwrap();
+        assert_eq!(config.local_host, LOOPBACK);
+    }
+
+    #[tokio::test]
+    async fn rejects_more_than_eight_jumps() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut candidate = input();
+        candidate.jumps = (0..9).map(jump).collect();
+        let error = build_config(candidate, None, &vault).unwrap_err();
+        assert!(error.contains("8 级"), "unexpected: {error}");
+    }
+
+    #[tokio::test]
+    async fn requires_password_when_none_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut candidate = input();
+        candidate.credentials.password = None;
+        let error = build_config(candidate, None, &vault).unwrap_err();
+        assert!(error.contains("密码"), "unexpected: {error}");
+    }
+
+    #[tokio::test]
+    async fn keeps_stored_secret_when_input_is_empty_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let existing = build_config(input(), None, &vault).unwrap();
+
+        let mut edit = input();
+        edit.id = Some(existing.id.clone());
+        edit.name = "NAS 2".into();
+        edit.credentials.password = None; // null keeps the stored value
+        let updated = build_config(edit, Some(&existing), &vault).unwrap();
+        assert_eq!(updated.name, "NAS 2");
+        assert_eq!(
+            updated.credentials.password_cipher,
+            existing.credentials.password_cipher
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_auth_type_and_clearing_password_drops_the_cipher() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let existing = build_config(input(), None, &vault).unwrap();
+
+        let mut edit = input();
+        edit.id = Some(existing.id.clone());
+        edit.credentials = CredentialInput {
+            auth_type: AuthType::PrivateKey,
+            password: Some(String::new()),
+            private_key: Some("-----BEGIN OPENSSH PRIVATE KEY-----".into()),
+            passphrase: None,
+        };
+        let updated = build_config(edit, Some(&existing), &vault).unwrap();
+        assert_eq!(updated.credentials.auth_type, AuthType::PrivateKey);
+        assert!(updated.credentials.password_cipher.is_none());
+        assert!(updated.credentials.private_key_cipher.is_some());
+    }
+
+    #[tokio::test]
+    async fn rejects_out_of_range_tuning_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+
+        let mut short_keepalive = input();
+        short_keepalive.keep_alive_seconds = 4;
+        assert!(build_config(short_keepalive, None, &vault).is_err());
+
+        let mut long_timeout = input();
+        long_timeout.connect_timeout_seconds = 121;
+        assert!(build_config(long_timeout, None, &vault).is_err());
+
+        let mut low_port = input();
+        low_port.local_port = 80;
+        assert!(build_config(low_port, None, &vault).is_err());
+    }
+
+    #[tokio::test]
+    async fn browser_url_scheme_check_is_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut candidate = input();
+        candidate.browser_url = "HTTPS://127.0.0.1:{port}/admin".into();
+        assert!(build_config(candidate, None, &vault).is_ok());
+    }
 }
