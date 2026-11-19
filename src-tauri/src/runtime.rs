@@ -123,21 +123,46 @@ impl Runtime {
     }
 
     pub async fn disconnect_all(self: &Arc<Self>) {
+        // Serialize against per-tunnel connect/disconnect so a concurrent
+        // "connect" cannot flip `desired_on` back on between the reset and the
+        // cancellation (which would strand a tunnel in "idle" while desired).
+        let mut ids: Vec<String> = {
+            let tasks = self.tasks.lock().await;
+            tasks.keys().cloned().collect()
+        };
+        ids.extend(self.store.snapshot().await.iter().map(|t| t.id.clone()));
+        ids.sort();
+        ids.dedup();
+        let mut guards = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let lock = self.operation_lock(id).await;
+            guards.push(lock.lock_owned().await);
+        }
+
         self.store.set_all_desired(false).await.ok();
         let entries: Vec<TaskEntry> = {
             let mut tasks = self.tasks.lock().await;
             let ids: Vec<String> = tasks.keys().cloned().collect();
             ids.into_iter().filter_map(|id| tasks.remove(&id)).collect()
         };
+        // Cancel first, then wait for every supervisor to release its listener
+        // and SSH sessions. Without this wait an immediate "全部开启" could
+        // race the teardown and report a spurious "本地端口被占用".
+        let mut waits = tokio::task::JoinSet::new();
         for entry in entries {
             entry.token.cancel();
+            waits.spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(3), entry.done.notified()).await;
+            });
         }
+        while waits.join_next().await.is_some() {}
         let mut statuses = self.statuses.write().await;
         for status in statuses.values_mut() {
             *status = TunnelStatus::idle(&status.tunnel_id);
         }
         let snapshot: Vec<TunnelStatus> = statuses.values().cloned().collect();
         drop(statuses);
+        drop(guards);
         for status in snapshot {
             self.emit(status);
         }
@@ -273,6 +298,9 @@ impl Runtime {
                 }
             }
 
+            // Report "connecting" before dialling so the UI never sits on a
+            // stale idle/error state while the first attempt is in flight.
+            self.set_status(TunnelStatus::connecting(&config.id)).await;
             let connect_result = tokio::select! {
                 _ = token.cancelled() => break,
                 result = ssh::connect(&context, &config) => result,
@@ -378,13 +406,25 @@ impl Runtime {
             .values()
             .filter(|status| status.phase == TunnelPhase::Reconnecting)
             .count();
+        let connecting = statuses
+            .values()
+            .filter(|status| status.phase == TunnelPhase::Connecting)
+            .count();
         drop(statuses);
-        let tooltip = if reconnecting > 0 {
-            format!("TunnelDock · {connected} 运行中 · {reconnecting} 重连中")
-        } else if connected > 0 {
-            format!("TunnelDock · {connected} 条隧道运行中")
-        } else {
+        let mut parts: Vec<String> = Vec::new();
+        if connected > 0 {
+            parts.push(format!("{connected} 运行中"));
+        }
+        if reconnecting > 0 {
+            parts.push(format!("{reconnecting} 重连中"));
+        }
+        if connecting > 0 {
+            parts.push(format!("{connecting} 准备中"));
+        }
+        let tooltip = if parts.is_empty() {
             "TunnelDock".to_string()
+        } else {
+            format!("TunnelDock · {}", parts.join(" · "))
         };
         if let Some(tray) = self.app.tray_by_id("tray") {
             let _ = tray.set_tooltip(Some(tooltip));
