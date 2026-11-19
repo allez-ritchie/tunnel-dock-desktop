@@ -1,19 +1,18 @@
 import { useRef, useState, type ReactNode } from "react";
-import type { AuthType, TunnelInput, TunnelView } from "../api";
+import type { AppView, AuthType, TunnelInput, TunnelView } from "../api";
 import { Icon, Modal, SecureNotice, WarningBox } from "../components/ui";
 import {
   MAX_JUMPS,
   chainPreview,
-  formFrom,
   hasSavedPassphrase,
   hasSavedPassword,
   hasSavedPrivateKey,
   jumpError,
   jumpFormFrom,
-  nextPort,
   signature,
-  toInput,
-  validate,
+  toTunnelInput,
+  tunnelFormFrom,
+  validateTunnel,
   type FormErrors,
   type JumpForm,
   type TunnelForm,
@@ -21,21 +20,15 @@ import {
 import { strings } from "../strings";
 
 interface Props {
-  tunnels: TunnelView[];
   initial: TunnelView | null;
+  usedBy: AppView[];
   onClose: () => void;
   onSave: (input: TunnelInput) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
 }
 
-export function EditorScreen({
-  tunnels,
-  initial,
-  onClose,
-  onSave,
-  onDelete,
-}: Props) {
-  const initialForm = useRef(formFrom(initial ?? undefined, nextPort(tunnels)));
+export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete }: Props) {
+  const initialForm = useRef(tunnelFormFrom(initial ?? undefined));
   const baseline = useRef(signature(initialForm.current));
   const [form, setForm] = useState<TunnelForm>(initialForm.current);
   const [errors, setErrors] = useState<FormErrors>({});
@@ -43,6 +36,7 @@ export function EditorScreen({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmSave, setConfirmSave] = useState(false);
   const [jumpEditor, setJumpEditor] = useState<{
     index: number;
     jump: JumpForm;
@@ -50,6 +44,7 @@ export function EditorScreen({
 
   const editing = initial !== null;
   const dirty = signature(form) !== baseline.current;
+  const usedCount = editing ? usedBy.length : 0;
 
   function patch(update: Partial<TunnelForm>) {
     setForm((current) => ({ ...current, ...update }));
@@ -60,18 +55,26 @@ export function EditorScreen({
     else onClose();
   }
 
-  async function save() {
-    const nextErrors = validate(form, tunnels);
-    setErrors(nextErrors);
-    if (Object.keys(nextErrors).length > 0) return;
+  async function doSave() {
     setSaving(true);
     setSaveError(null);
     try {
-      await onSave(toInput(form));
+      await onSave(toTunnelInput(form));
     } catch (error) {
       setSaveError(strings.editorSaveFailed(String(error)));
       setSaving(false);
     }
+  }
+
+  async function save() {
+    const nextErrors = validateTunnel(form);
+    setErrors(nextErrors);
+    if (Object.keys(nextErrors).length > 0) return;
+    if (editing && usedCount > 0) {
+      setConfirmSave(true);
+      return;
+    }
+    await doSave();
   }
 
   async function remove() {
@@ -84,13 +87,6 @@ export function EditorScreen({
       setSaving(false);
     }
   }
-
-  const localPreview = `http://127.0.0.1:${form.localPort || "?"}/  →  ${
-    form.remoteHost || "?"
-  }:${form.remotePort || "?"}`;
-  const browserPreview = form.browserUrl.trim()
-    ? form.browserUrl.replace("{port}", form.localPort || "?")
-    : `http://127.0.0.1:${form.localPort || "?"}/`;
 
   return (
     <div className="screen editor-screen">
@@ -105,12 +101,16 @@ export function EditorScreen({
           <Icon name="arrowLeft" size={19} />
         </button>
         <div className="editor-heading">
-          <h1>{editing ? strings.editorEdit : strings.editorNew}</h1>
+          <h1>{editing ? strings.editorEditTunnel : strings.editorNewTunnel}</h1>
           <p className="mono">{chainPreview(form)}</p>
         </div>
       </header>
 
       <div className="editor-scroll">
+        {usedCount > 0 ? (
+          <WarningBox text={strings.editorTunnelUsingHint(usedCount)} />
+        ) : null}
+
         <FormCard title={strings.editorBasic}>
           <Field
             label={strings.editorName}
@@ -122,40 +122,7 @@ export function EditorScreen({
               setErrors(({ name: _name, ...rest }) => rest);
             }}
           />
-          <Field
-            label={strings.editorLocalPort}
-            hint={strings.editorLocalPortHint}
-            value={form.localPort}
-            inputMode="numeric"
-            error={errors.localPort}
-            onChange={(value) => {
-              patch({ localPort: value.replace(/\D/g, "").slice(0, 5) });
-              setErrors(({ localPort: _port, ...rest }) => rest);
-            }}
-          />
-          <div className="field-row">
-            <Field
-              label={strings.editorRemoteHost}
-              placeholder={strings.editorRemoteHostHint}
-              value={form.remoteHost}
-              error={errors.remoteHost}
-              onChange={(value) => {
-                patch({ remoteHost: value });
-                setErrors(({ remoteHost: _host, ...rest }) => rest);
-              }}
-            />
-            <Field
-              label={strings.editorRemotePort}
-              value={form.remotePort}
-              inputMode="numeric"
-              error={errors.remotePort}
-              onChange={(value) => {
-                patch({ remotePort: value.replace(/\D/g, "").slice(0, 5) });
-                setErrors(({ remotePort: _port, ...rest }) => rest);
-              }}
-            />
-          </div>
-          <code className="form-preview">{localPreview}</code>
+          <code className="form-preview">{chainPreview(form)}</code>
         </FormCard>
 
         <FormCard title={strings.editorSshSection}>
@@ -387,33 +354,12 @@ export function EditorScreen({
           </button>
         </FormCard>
 
-        <FormCard title={strings.editorBrowserSection}>
-          <Field
-            label={strings.editorBrowserUrl}
-            placeholder={strings.editorBrowserUrlHint}
-            value={form.browserUrl}
-            error={errors.browserUrl}
-            onChange={(value) => {
-              patch({ browserUrl: value });
-              setErrors(({ browserUrl: _url, ...rest }) => rest);
-            }}
-          />
-          <p className="field-hint">{strings.editorBrowserUrlHelp}</p>
-          <code className="form-preview accent">{browserPreview}</code>
-        </FormCard>
-
         <FormCard title={strings.editorAdvanced}>
           <SwitchRow
             title={strings.editorAutoReconnect}
             subtitle={strings.editorAutoReconnectDesc}
             checked={form.autoReconnect}
             onChange={(value) => patch({ autoReconnect: value })}
-          />
-          <SwitchRow
-            title={strings.editorAutoStart}
-            subtitle={strings.editorAutoStartDesc}
-            checked={form.autoStartOnBoot}
-            onChange={(value) => patch({ autoStartOnBoot: value })}
           />
           <SwitchRow
             title={strings.editorStrictHost}
@@ -456,7 +402,7 @@ export function EditorScreen({
             onClick={() => setConfirmDelete(true)}
           >
             <Icon name="trash" size={16} />
-            {strings.editorDelete}
+            {strings.editorDeleteTunnel}
           </button>
         ) : null}
       </div>
@@ -507,11 +453,28 @@ export function EditorScreen({
         />
       ) : null}
 
+      {confirmSave ? (
+        <ConfirmInline
+          title={strings.tunnelEditConfirmTitle}
+          body={strings.tunnelEditConfirmBody(form.name.trim(), usedCount)}
+          confirmLabel={strings.tunnelEditConfirm}
+          onCancel={() => setConfirmSave(false)}
+          onConfirm={() => {
+            setConfirmSave(false);
+            void doSave();
+          }}
+        />
+      ) : null}
+
       {confirmDelete && initial ? (
         <ConfirmInline
-          title={strings.deleteTitle}
-          body={strings.deleteBody(initial.name)}
-          confirmLabel={strings.deleteConfirm}
+          title={strings.tunnelDeleteTitle}
+          body={
+            usedCount > 0
+              ? strings.tunnelDeleteBody(initial.name, usedCount)
+              : strings.tunnelDeleteBodyUnused(initial.name)
+          }
+          confirmLabel={strings.tunnelDeleteConfirm}
           onCancel={() => setConfirmDelete(false)}
           onConfirm={() => {
             setConfirmDelete(false);

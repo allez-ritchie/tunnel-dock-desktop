@@ -7,8 +7,10 @@ interface Props {
   knownHostsCount: number;
   autostart: boolean;
   version: string;
+  tunnelCount: number;
+  appCount: number;
+  groupCount: number;
   onThemeChange: (theme: ThemeMode) => void;
-  onBack: () => void;
   onClearKnownHosts: () => Promise<void>;
   onMessage: (text: string) => void;
 }
@@ -18,8 +20,10 @@ export function SettingsScreen({
   knownHostsCount,
   autostart,
   version,
+  tunnelCount,
+  appCount,
+  groupCount,
   onThemeChange,
-  onBack,
   onClearKnownHosts,
   onMessage,
 }: Props) {
@@ -38,20 +42,15 @@ export function SettingsScreen({
   }
 
   return (
-    <div className="screen settings-screen">
-      <header className="editor-header">
-        <button
-          type="button"
-          className="icon-btn"
-          onClick={onBack}
-          aria-label={strings.editorBack}
-          title={strings.editorBack}
-        >
-          <Icon name="arrowLeft" size={19} />
-        </button>
-        <div className="editor-heading">
-          <h1>{strings.settingsTitle}</h1>
-          <p className="mono">{strings.appTagline}</p>
+    <div className="screen tab-screen settings-screen">
+      <header className="page-header">
+        <div className="brand">
+          <BrandMark size={44} />
+          <div>
+            <span className="brand-kicker">TUNNELDOCK</span>
+            <h1>{strings.settingsTitle}</h1>
+            <p className="brand-tagline">{strings.appTagline}</p>
+          </div>
         </div>
       </header>
 
@@ -80,6 +79,17 @@ export function SettingsScreen({
               <p className="subtle">{strings.settingsAutostartHint}</p>
             </div>
           </div>
+        </SettingsCard>
+
+        <SettingsCard
+          icon={<Icon name="apps" size={20} />}
+          title={strings.settingsData}
+          subtitle={strings.settingsDataDesc}
+        >
+          <p className="settings-counts mono">
+            {strings.settingsDataCounts(tunnelCount, appCount, groupCount)}
+          </p>
+          <p className="field-hint">{strings.settingsDataHint}</p>
         </SettingsCard>
 
         <SettingsCard
@@ -131,7 +141,6 @@ export function SettingsScreen({
           subtitle={strings.settingsSecurityBody}
         >
           <SecureNotice text={strings.editorSecretNotice} />
-          <p className="field-hint">{strings.settingsDataHint}</p>
         </SettingsCard>
 
         <SettingsCard
