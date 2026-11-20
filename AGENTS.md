@@ -32,7 +32,7 @@
 
 | 路径 | 作用 |
 | --- | --- |
-| `src/` | 前端（React + TypeScript）。`App.tsx` 负责页面栈与底部导航，`api.ts` 是唯一的 Tauri 命令封装入口。 |
+| `src/` | 前端（React + TypeScript）。`App.tsx` 负责页面栈与左侧导航，`api.ts` 是唯一的 Tauri 命令封装入口。 |
 | `src/screens/` | `AppsScreen`（应用组折叠）、`TunnelsScreen`、`AppEditorScreen`、`TunnelEditorScreen`、`SshConfigImportScreen`（导入 `~/.ssh/config`）、`BundleCard`（配置包导出/导入）、`ErrorDetailScreen`、`SettingsScreen`。 |
 | `src/components/` | 可复用的展示组件（状态点、徽标、警示框、表单字段等）与 `LocalKeyPicker`（从 `~/.ssh` 选私钥）。 |
 | `src/strings.ts` | **所有用户可见文案**集中定义，禁止在组件里散落硬编码中文/英文。 |
@@ -227,8 +227,9 @@ build(tauri): 补充 Linux 打包所需的系统依赖说明
   不要在组件内部复制业务可变状态。
 - 调用后端统一走 `src/api.ts`，组件里不直接拼 `invoke` 字符串。
 - 破坏性操作（删除应用、删除应用组、删除隧道、修改被引用的隧道、清除已知主机）必须二次确认。
-- 导航为底部三页（应用 / 隧道 / 设置）。界面内不再提供全局“全部开启 / 全部断开”，
-  批量操作以应用组为单位；托盘菜单的“全部断开”保留为紧急停止入口。
+- 导航为左侧竖排三页（应用 / 隧道 / 设置）：桌面窗口宽大于高，横向排布更省纵向空间。
+  界面内不再提供全局“全部开启 / 全部断开”，批量操作以应用组为单位；托盘菜单的
+  “全部断开”保留为紧急停止入口。
 
 ### 6.2 凭据与密钥
 
