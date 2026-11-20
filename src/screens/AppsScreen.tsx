@@ -198,11 +198,15 @@ export function AppsScreen({
                   item.status.phase,
                 ) && !item.unavailable,
               );
-              const stoppable = groupItems.some(
-                (item) =>
-                  ["connected", "connecting", "reconnecting"].includes(
-                    item.status.phase,
-                  ) || item.app.desiredOn,
+              /*
+               * 只有“还在运行 / 仍在尝试连接”的成员才需要停止。
+               * 不能再看 `desiredOn`：重启恢复、托盘“全部断开”等路径会把意图与
+               * 实际状态拆开，用意图判断会让「停止整组」在全部停止后仍然可点。
+               */
+              const stoppable = groupItems.some((item) =>
+                ["connected", "connecting", "reconnecting"].includes(
+                  item.status.phase,
+                ),
               );
               return (
                 <section
