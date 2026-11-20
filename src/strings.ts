@@ -58,6 +58,9 @@ export const strings = {
   appCardMore: "更多操作",
   appCardOpenBrowser: "打开浏览器",
   appCardCopyUrl: "复制地址",
+  appCardShowSecret: "显示 SSH 账号与地址",
+  appCardHideSecret: "隐藏 SSH 账号与地址",
+  appCardSecretHidden: "••••••••••••",
   appCopied: "地址已复制",
   appDeleteTitle: "删除应用？",
   appDeleteBody: (name: string) =>

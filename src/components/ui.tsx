@@ -1,4 +1,4 @@
-import type { CSSProperties, ReactNode } from "react";
+import { useState, type CSSProperties, type ReactNode } from "react";
 import type { TunnelPhase } from "../api";
 import { strings } from "../strings";
 
@@ -201,6 +201,20 @@ const paths: Record<string, ReactNode> = {
       <path d="M12 12v9" />
     </>
   ),
+  eye: (
+    <>
+      <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z" />
+      <circle cx="12" cy="12" r="2.8" />
+    </>
+  ),
+  eyeOff: (
+    <>
+      <path d="M3 3l18 18" />
+      <path d="M10.6 6.1A9.7 9.7 0 0 1 12 5.5c6.4 0 10 6.5 10 6.5a17 17 0 0 1-3 3.9" />
+      <path d="M6.5 7.9A17 17 0 0 0 2 12s3.6 6.5 10 6.5a9.9 9.9 0 0 0 4.2-.9" />
+      <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+    </>
+  ),
 };
 
 export function Icon({
@@ -347,6 +361,47 @@ export function MonoAddress({
     <span className="mono" style={color ? { color } : undefined}>
       {children}
     </span>
+  );
+}
+
+/**
+ * A single sensitive value (e.g. `user@host:port`) that starts masked and is
+ * revealed as a whole on click. The value is never split across elements, so
+ * `user@ip:port` always shows and hides as one unit.
+ */
+export function RevealText({
+  value,
+  hiddenLabel,
+  showLabel,
+  hideLabel,
+}: {
+  value: string;
+  /** 隐藏时显示的占位文本。 */
+  hiddenLabel: string;
+  /** 展开时的按钮说明。 */
+  showLabel: string;
+  /** 收起时的按钮说明。 */
+  hideLabel: string;
+}) {
+  const [revealed, setRevealed] = useState(false);
+  const label = revealed ? hideLabel : showLabel;
+  return (
+    <button
+      type="button"
+      className={`reveal-text${revealed ? " is-revealed" : " is-masked"}`}
+      aria-pressed={revealed}
+      aria-label={label}
+      title={label}
+      onClick={(event) => {
+        event.stopPropagation();
+        setRevealed((current) => !current);
+      }}
+    >
+      <span className="reveal-text-value mono">
+        {revealed ? value : hiddenLabel}
+      </span>
+      <Icon name={revealed ? "eyeOff" : "eye"} size={13} />
+    </button>
   );
 }
 

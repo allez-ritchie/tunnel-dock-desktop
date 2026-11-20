@@ -6,6 +6,7 @@ import {
   ConfirmDialog,
   Icon,
   MonoAddress,
+  RevealText,
   SectionHeader,
   StatusDot,
   WarningBox,
@@ -483,11 +484,21 @@ function AppCard({
       </div>
 
       <h3 className="card-title">{app.name}</h3>
-      <p className="card-ssh mono">
+      <p className="card-ssh">
         <Icon name="link" size={12} />
-        {tunnel
-          ? `${tunnel.name} · ${tunnel.endpoint}`
-          : strings.errorDetailTunnelMissing}
+        {tunnel ? (
+          <>
+            <span className="card-ssh-name">{tunnel.name}</span>
+            <RevealText
+              value={tunnel.endpoint}
+              hiddenLabel={strings.appCardSecretHidden}
+              showLabel={strings.appCardShowSecret}
+              hideLabel={strings.appCardHideSecret}
+            />
+          </>
+        ) : (
+          strings.errorDetailTunnelMissing
+        )}
       </p>
 
       <div className="route-box">
