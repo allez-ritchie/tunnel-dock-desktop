@@ -46,6 +46,9 @@
 | 一键跳转浏览器 | 连通后直接打开 `http://127.0.0.1:端口`，支持自定义 URL 与 `{port}` 占位符 |
 | 配置增删改 | 隧道、应用、应用组均可增删改；跳板机可增删与上下移动排序 |
 | 变更保护 | 隧道被应用引用时，删除或修改需要二次确认；确认后会先停止相关应用（应用本身保留） |
+| 复用本机私钥 | 隧道与跳板机可直接选用 `~/.ssh` 下的私钥；前端只传文件名，密钥由后端读取并加密落盘 |
+| 导入 ssh config | 一键读取 `~/.ssh/config`，勾选主机批量导入为隧道，自动还原 `HostName`/`User`/`Port`/`ProxyJump` |
+| 配置包导出导入 | 应用组、应用、隧道导出为 `.zip`；导入时按名称合并到现有配置，可跨设备迁移 |
 
 ## 构建
 
@@ -100,6 +103,36 @@ cargo test --manifest-path src-tauri/Cargo.toml
 5. 不使用应用组的场景下，所有应用默认放在名为 `default` 的组里，该组不可删除。
 6. 关闭窗口默认隐藏到托盘；需要退出时使用托盘菜单的“退出”。
 
+### 复用本机 `~/.ssh`
+
+- 隧道编辑页的「私钥」认证方式下，可直接从「本机私钥」下拉框选择 `~/.ssh` 中的私钥
+  （例如 `id_ed25519`），不需要把密钥内容粘贴到界面。前端只把**文件名**交给后端，
+  后端读取文件后立即用主密钥加密落盘，密钥内容不会进入前端状态、日志或导出的配置包。
+- 「隧道」页右上角的「导入 ~/.ssh/config」会解析本机 OpenSSH 配置，列出所有具体
+  `Host` 条目，勾选后批量创建隧道：`HostName`、`User`、`Port`、`ProxyJump`（按链路
+  展开为多级跳板）都会被还原；`IdentityFile` 指向 `~/.ssh` 内存在的私钥时会自动带入。
+- 同名隧道不会被重复创建；`Host *` 之类的通配块只作为默认值补全，不会单独导入。
+- 以下写法暂不支持导入（列表中会标黄并说明原因），需要手动创建隧道：
+  `ProxyCommand`、`Include`、`Match`，以及 `ProxyJump` 里的主机没有在 config 中定义。
+- 私钥带口令时，`~/.ssh` 里的文件本身是加密的，导入后请在隧道编辑页填写「私钥口令」。
+- 该功能只读取 `~/.ssh`，从不修改其中的任何文件。
+
+### 配置包导出 / 导入
+
+「设置」页的「配置包」卡片可以把**应用组 + 应用 + 隧道**导出为一个 `.zip`：
+
+- 压缩包内是 `tunneldock-export.json`（UTF-8 明文清单，方便排错）和 `README.txt`；
+- 实体之间按**名称**引用，因此换一台设备导入后引用关系仍然成立；
+- 私钥以明文写入清单（便于跨设备还原），请像保管私钥一样保管该文件；
+  **密码认证的隧道只导出定义、不导出密码**，界面会提示导入后需要重新填写；
+- 不含运行状态（`desiredOn`），导入后不会自动启动任何转发。
+
+导入时会先弹出预览确认，再按名称合并到现有配置：
+
+- 隧道按 `主机 + 端口 + 用户名` 去重，已存在时复用；应用按「同组同名」去重；
+- 引用不到隧道或应用组的应用会被丢弃，并在结果里报告数量；
+- 与现有应用撞了本地端口的应用仍会导入，但会列出需要改端口的名字。
+
 ## 数据位置
 
 配置与密钥保存在 Tauri 应用数据目录：
@@ -126,6 +159,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - 本地监听默认绑定 `127.0.0.1`，不会暴露到局域网。
 - 删除隧道或应用组、修改被引用的隧道都属于破坏性操作，界面会二次确认；确认后
   先停止相关应用，再落盘配置。
+- 读取 `~/.ssh` 是只读操作：导入私钥时前端只传文件名，后端读取后立即加密；
+  私钥文件路径做了白名单校验（必须是 `~/.ssh` 下的普通文件，拒绝 `../` 之类的路径）。
+- 导入配置包会校验清单的 `kind` 与 `version`，并限制解压后的清单大小，避免被构造的
+  压缩包撑爆内存；密码不会进入配置包。
 
 ## 目录结构
 
@@ -136,11 +173,14 @@ src/                          # React + TypeScript 前端
 ├── strings.ts                # 所有用户可见文案
 ├── draft.ts                  # 隧道 / 应用表单状态与校验
 ├── components/ui.tsx         # 通用展示组件、图标与底部导航
+├── components/LocalKeyPicker.tsx # 从 ~/.ssh 选择私钥
 ├── screens/
 │   ├── AppsScreen.tsx        # 应用组 + 可折叠应用卡片
 │   ├── TunnelsScreen.tsx     # 隧道列表与连接测试
 │   ├── AppEditorScreen.tsx   # 应用编辑器
 │   ├── TunnelEditorScreen.tsx# 隧道编辑器与跳板机
+│   ├── SshConfigImportScreen.tsx # 导入 ~/.ssh/config
+│   ├── BundleCard.tsx        # 配置包导出 / 导入
 │   ├── ErrorDetailScreen.tsx # 应用不可用详情
 │   └── SettingsScreen.tsx    # 设置 / 版本 / 数据统计
 └── styles.css                # 设计令牌与布局
@@ -151,6 +191,8 @@ src-tauri/src/
 ├── store.rs                  # 配置文档 JSON 持久化（原子写入）与旧数据迁移
 ├── secrets.rs                # AES-256-GCM 凭据加解密
 ├── known_hosts.rs            # TOFU 主机密钥仓库
+├── local_ssh.rs              # 只读探测 ~/.ssh 私钥并解析 ~/.ssh/config
+├── portable.rs               # 配置包（.zip）的导出、预览与合并导入
 ├── ssh.rs                    # russh 连接、跳板链、按应用转发与连接测试
 ├── runtime.rs                # 按应用监督、保活、重连、组启停、状态广播
 └── commands.rs               # Tauri 命令
@@ -178,6 +220,26 @@ cargo test --manifest-path src-tauri/Cargo.toml
 包含模型归一化、配置文档持久化、旧版配置迁移、凭据加解密、TOFU 主机密钥、重连退避、
 按应用的启动前校验（隧道/应用组存在、本地端口冲突），以及 `commands.rs` 的入参校验
 （端口范围、跳板数量上限、应用组与隧道引用、凭据密文保留语义）。
+
+另外还有两组针对真实文件的用例（默认忽略，需要显式开启）：
+
+```bash
+# 用本机真实的 ~/.ssh/config 校验解析器，会打印每条 Host 的解析结果
+TD_REAL_SSH_CONFIG=~/.ssh/config cargo test --manifest-path src-tauri/Cargo.toml \
+  --lib real_ssh_config -- --ignored --nocapture
+
+# 用本机真实的 ~/.ssh 校验私钥探测与读取
+TD_REAL_SSH_DIR=~/.ssh cargo test --manifest-path src-tauri/Cargo.toml \
+  --lib real_ssh_keys -- --ignored --nocapture
+
+# 生成真实配置包，供 unzip / python zipfile 等外部工具校验
+TD_ZIP_DIR=/tmp/zipcheck cargo test --manifest-path src-tauri/Cargo.toml \
+  --lib real_zip -- --ignored --nocapture
+```
+
+配置包相关的常规用例覆盖：zip 往返后实体与私钥口令完整、重复导入按端点去重、
+密码型隧道只导出定义、悬空引用被丢弃、外来/更高版本压缩包被拒绝、
+外部工具重新打包后仍能识别，以及缺少清单或非 zip 文件的报错。
 
 ### 3. 端到端隧道测试（忽略标记，需真实 sshd）
 

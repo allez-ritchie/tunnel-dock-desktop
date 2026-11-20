@@ -33,8 +33,8 @@
 | 路径 | 作用 |
 | --- | --- |
 | `src/` | 前端（React + TypeScript）。`App.tsx` 负责页面栈与底部导航，`api.ts` 是唯一的 Tauri 命令封装入口。 |
-| `src/screens/` | `AppsScreen`（应用组折叠）、`TunnelsScreen`、`AppEditorScreen`、`TunnelEditorScreen`、`ErrorDetailScreen`、`SettingsScreen`。 |
-| `src/components/` | 可复用的展示组件（状态点、徽标、警示框、表单字段等）。 |
+| `src/screens/` | `AppsScreen`（应用组折叠）、`TunnelsScreen`、`AppEditorScreen`、`TunnelEditorScreen`、`SshConfigImportScreen`（导入 `~/.ssh/config`）、`BundleCard`（配置包导出/导入）、`ErrorDetailScreen`、`SettingsScreen`。 |
+| `src/components/` | 可复用的展示组件（状态点、徽标、警示框、表单字段等）与 `LocalKeyPicker`（从 `~/.ssh` 选私钥）。 |
 | `src/strings.ts` | **所有用户可见文案**集中定义，禁止在组件里散落硬编码中文/英文。 |
 | `src/styles.css` | 设计令牌（颜色、圆角、字体）与布局样式，配色统一在此维护。 |
 | `src-tauri/src/main.rs` | Tauri 可执行入口，只做 `tunnel_dock_lib::run()` 调用。 |
@@ -43,6 +43,8 @@
 | `src-tauri/src/store.rs` | 隧道 / 应用 / 应用组配置文档的 JSON 持久化（原子写入）、归一化与旧版数据迁移。 |
 | `src-tauri/src/secrets.rs` | AES-256-GCM 凭据加解密，主密钥落盘为 `0600` 文件。 |
 | `src-tauri/src/known_hosts.rs` | TOFU 主机密钥仓库，指纹首次固定、变更即拒绝。 |
+| `src-tauri/src/local_ssh.rs` | 只读探测 `~/.ssh`：列出私钥、解析 `~/.ssh/config`（`HostName`/`User`/`Port`/`ProxyJump`）。 |
+| `src-tauri/src/portable.rs` | 配置包（`.zip`）导出、预览与合并导入：应用组、应用、隧道。 |
 | `src-tauri/src/ssh.rs` | `russh` 连接、跳板链、按应用的 `direct-tcpip` 本地监听与双向转发、无转发的连通性探测。 |
 | `src-tauri/src/runtime.rs` | 按应用监督：连接生命周期、保活、重连、组启停、隧道连接测试、状态广播。 |
 | `src-tauri/src/commands.rs` | 暴露给前端的 `#[tauri::command]`，只做参数校验与转调。 |
