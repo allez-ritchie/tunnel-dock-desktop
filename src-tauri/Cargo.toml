@@ -21,6 +21,12 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 russh = "0.65"
+# russh 默认通过 aws-lc-rs 引入 aws-lc-sys。Windows x86-64 上 aws-lc-sys 编译汇编文件
+# 需要 NASM 汇编器，否则构建脚本直接 panic（"NASM command not found! Build cannot continue."）。
+# 这里显式打开 aws-lc-rs 的 prebuilt-nasm 特性，让 aws-lc-sys 在检测不到 NASM 时回退到
+# crate 内置的预编译汇编对象，开发者无需额外安装 NASM；其他平台该特性不生效，
+# 若环境里确实装了 NASM，仍会优先使用 NASM。
+aws-lc-rs = { version = "1", default-features = false, features = ["prebuilt-nasm"] }
 async-trait = "0.1"
 aes-gcm = "0.10"
 base64 = "0.22"

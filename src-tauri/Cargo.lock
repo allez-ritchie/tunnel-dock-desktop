@@ -5280,6 +5280,7 @@ version = "1.0.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "async-trait",
+ "aws-lc-rs",
  "base64 0.22.1",
  "open",
  "rand 0.8.8",
