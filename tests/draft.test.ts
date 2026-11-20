@@ -486,6 +486,7 @@ describe("form hydration", () => {
             hasPrivateKey: true,
             hasPassphrase: true,
           },
+          inheritedFrom: null,
         },
       ],
     });

@@ -1221,6 +1221,16 @@ button:disabled {
   white-space: nowrap;
 }
 
+/* 跳板机凭据复用自另一条隧道时的说明行。 */
+.jump-main .jump-inherited {
+  color: var(--online);
+  font-size: 11px;
+  font-style: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .jump-tools {
   display: flex;
   align-items: center;

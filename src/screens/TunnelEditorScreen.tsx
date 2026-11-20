@@ -14,6 +14,7 @@ import {
   toTunnelInput,
   tunnelFormFrom,
   validateTunnel,
+  usesInheritedCredentials,
   usesLocalKey,
   type FormErrors,
   type JumpForm,
@@ -289,6 +290,11 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
                     <span className="mono">
                       {jump.username}@{jump.host}:{jump.port}
                     </span>
+                    {usesInheritedCredentials(jump) ? (
+                      <em className="jump-inherited">
+                        {strings.jumpInherited(jump.inheritedFrom ?? "")}
+                      </em>
+                    ) : null}
                   </button>
                   <div className="jump-tools">
                     <button
@@ -756,6 +762,11 @@ function JumpDialog({
           </>
         )}
         <p className="field-hint">{strings.jumpHelp}</p>
+        {usesInheritedCredentials(jump) ? (
+          <WarningBox
+            text={strings.jumpInherited(jump.inheritedFrom ?? "")}
+          />
+        ) : null}
         {error ? <WarningBox text={error} danger /> : null}
       </div>
       <div className="dialog-actions">

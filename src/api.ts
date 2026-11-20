@@ -33,6 +33,11 @@ export interface JumpView {
   port: number;
   username: string;
   credentials: CredentialState;
+  /**
+   * 凭据由哪个隧道提供：跳板机与某条已配置的隧道是同一台主机时，密码无需重复输入。
+   * null 表示使用跳板机自己的凭据。
+   */
+  inheritedFrom: string | null;
 }
 
 /** Reusable SSH access definition. Holds no local port and no remote target. */

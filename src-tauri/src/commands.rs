@@ -34,7 +34,11 @@ pub async fn load_dock(state: State<'_, AppState>) -> Result<DockView, String> {
         .filter(|status| app_ids.contains(&status.app_id))
         .collect();
     Ok(DockView {
-        tunnels: snapshot.tunnels.iter().map(TunnelView::from).collect(),
+        tunnels: snapshot
+            .tunnels
+            .iter()
+            .map(|tunnel| TunnelView::resolved(tunnel, &snapshot))
+            .collect(),
         apps: snapshot.apps.iter().map(AppView::from).collect(),
         groups: snapshot.groups.iter().map(GroupView::from).collect(),
         statuses,
@@ -54,7 +58,8 @@ pub async fn save_tunnel(
     let config = build_tunnel(input, existing.as_ref(), &state.secrets, &state.local_ssh)?;
     let saved = state.runtime.clone().save_tunnel(config).await?;
     crate::sync_autostart(&app).await;
-    Ok(TunnelView::from(&saved))
+    let snapshot = state.store.snapshot().await;
+    Ok(TunnelView::resolved(&saved, &snapshot))
 }
 
 #[tauri::command]
@@ -279,11 +284,15 @@ pub async fn import_local_ssh_config(
         };
         let saved = state.runtime.clone().save_tunnel(config).await?;
         existing_names.insert(host.alias.to_lowercase());
-        created.push(TunnelView::from(&saved));
+        created.push(saved);
     }
 
     crate::sync_autostart(&app).await;
-    Ok(created)
+    let snapshot = state.store.snapshot().await;
+    Ok(created
+        .iter()
+        .map(|tunnel| TunnelView::resolved(tunnel, &snapshot))
+        .collect())
 }
 
 fn local_ssh_credentials(

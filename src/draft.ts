@@ -28,6 +28,8 @@ export interface JumpForm {
   hasPassword: boolean;
   hasPrivateKey: boolean;
   hasPassphrase: boolean;
+  /** 凭据来自哪条隧道（`host:port` 与某条隧道相同时自动复用其密码）。 */
+  inheritedFrom: string | null;
 }
 
 export interface TunnelForm {
@@ -95,6 +97,7 @@ export function jumpFormFrom(jump?: JumpView): JumpForm {
     hasPassword: jump?.credentials.hasPassword ?? false,
     hasPrivateKey: jump?.credentials.hasPrivateKey ?? false,
     hasPassphrase: jump?.credentials.hasPassphrase ?? false,
+    inheritedFrom: jump?.inheritedFrom ?? null,
   };
 }
 
@@ -163,6 +166,11 @@ export function hasSavedPassphrase(form: JumpForm | TunnelForm): boolean {
 }
 
 export type FormErrors = Record<string, string>;
+
+/** 跳板机的凭据是否复用自另一条隧道（同主机同端口，无需重复输入密码）。 */
+export function usesInheritedCredentials(jump: JumpForm): boolean {
+  return (jump.inheritedFrom ?? "").trim() !== "";
+}
 
 function parsePort(value: string): number | null {
   if (!/^\d{1,5}$/.test(value)) return null;

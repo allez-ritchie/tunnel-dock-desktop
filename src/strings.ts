@@ -175,6 +175,8 @@ export const strings = {
   jumpPassphrase: "私钥口令（可选）",
   jumpSave: "保存跳板机",
   jumpHelp: "跳板机按链路顺序连接，凭据同样使用 AES-256-GCM 加密。",
+  jumpInherited: (source: string) =>
+    `凭据复用自隧道“${source}”：同一台主机只需配置一次密码。`,
 
   // ------------------------------------------------------- local ~/.ssh keys
   localKeyUse: "使用 ~/.ssh 中的私钥",

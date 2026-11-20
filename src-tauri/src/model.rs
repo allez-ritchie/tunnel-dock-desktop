@@ -283,6 +283,62 @@ impl DockSnapshot {
             .collect()
     }
 
+    /// Finds the tunnel that defines the SSH endpoint of a jump host.
+    ///
+    /// Importing `~/.ssh/config` creates one tunnel per `Host` alias and turns
+    /// `ProxyJump` aliases into jump hosts. Those jump hosts carry no secret
+    /// (the file has none), yet the same host exists as its own tunnel where the
+    /// user *did* enter the password. Matching the jump back to that tunnel is
+    /// what lets one password serve every tunnel jumping through it.
+    ///
+    /// The exact `user@host:port` match wins because it identifies the same SSH
+    /// account unambiguously; the alias is the fallback for jump hosts whose
+    /// address was edited after the import.
+    pub fn credential_source_for_jump<'a>(
+        &'a self,
+        owner: &TunnelConfig,
+        jump: &JumpHost,
+    ) -> Option<&'a TunnelConfig> {
+        let owner_id = owner.id.as_str();
+        let endpoint = |tunnel: &&TunnelConfig| {
+            tunnel.id != owner_id
+                && tunnel.ssh_host.trim().eq_ignore_ascii_case(jump.host.trim())
+                && tunnel.ssh_port == jump.port
+                && tunnel.ssh_user.trim() == jump.username.trim()
+                && tunnel.credentials.has_secret()
+        };
+        let named = |tunnel: &&TunnelConfig| {
+            tunnel.id != owner_id
+                && !jump.label.trim().is_empty()
+                && tunnel.name.trim().eq_ignore_ascii_case(jump.label.trim())
+                && tunnel.credentials.has_secret()
+        };
+        self.tunnels
+            .iter()
+            .find(endpoint)
+            .or_else(|| self.tunnels.iter().find(named))
+    }
+
+    /// Returns `owner` with every secret-less jump host taking its credentials
+    /// from the tunnel that defines that host. Used by both the connect path and
+    /// the UI state, so "已配置密码" always means the same thing.
+    pub fn with_inherited_jump_credentials(&self, owner: &TunnelConfig) -> TunnelConfig {
+        let mut resolved = owner.clone();
+        let mut inherited: Vec<(usize, SshCredentials)> = Vec::new();
+        for (index, jump) in resolved.jumps.iter().enumerate() {
+            if jump.credentials.has_secret() {
+                continue;
+            }
+            if let Some(source) = self.credential_source_for_jump(owner, jump) {
+                inherited.push((index, source.credentials.clone()));
+            }
+        }
+        for (index, credentials) in inherited {
+            resolved.jumps[index].credentials = credentials;
+        }
+        resolved
+    }
+
     /// The default group always exists and comes first; dangling app group
     /// references fall back to it instead of disappearing from the UI.
     pub fn normalized(mut self) -> Self {
@@ -343,6 +399,8 @@ pub struct JumpView {
     pub port: u16,
     pub username: String,
     pub credentials: CredentialState,
+    /// 凭据来自哪个隧道（跳板机与某个隧道是同一台主机时）。`None` 表示凭据自己的。
+    pub inherited_from: Option<String>,
 }
 
 impl From<&JumpHost> for JumpView {
@@ -354,6 +412,7 @@ impl From<&JumpHost> for JumpView {
             port: value.port,
             username: value.username.clone(),
             credentials: CredentialState::from(&value.credentials),
+            inherited_from: None,
         }
     }
 }
@@ -398,6 +457,29 @@ impl From<&TunnelConfig> for TunnelView {
             endpoint: value.endpoint(),
             chain_summary: value.chain_summary(),
         }
+    }
+}
+
+impl TunnelView {
+    /// Builds the frontend view with jump credentials resolved to their final,
+    /// effective state so the editor can say "已保存密码" when the secret actually
+    /// comes from another tunnel.
+    pub fn resolved(value: &TunnelConfig, snapshot: &DockSnapshot) -> Self {
+        let resolved = snapshot.with_inherited_jump_credentials(value);
+        let mut view = TunnelView::from(&resolved);
+        for (jump_view, original) in view.jumps.iter_mut().zip(value.jumps.iter()) {
+            if original.credentials.has_secret() {
+                continue;
+            }
+            let effective = &jump_view.credentials;
+            if !(effective.has_password || effective.has_private_key) {
+                continue;
+            }
+            jump_view.inherited_from = snapshot
+                .credential_source_for_jump(value, original)
+                .map(|source| source.name.clone());
+        }
+        view
     }
 }
 
@@ -846,5 +928,171 @@ mod tests {
         assert_eq!(status.phase, TunnelPhase::Error);
         assert_eq!(status.error_code.as_deref(), Some("tunnel_deleted"));
         assert_eq!(status.block_reason, AppBlockReason::TunnelDeleted);
+    }
+
+    fn password_credentials() -> SshCredentials {
+        SshCredentials {
+            auth_type: AuthType::Password,
+            password_cipher: Some("v1.iv.data".into()),
+            ..SshCredentials::default()
+        }
+    }
+
+    /// Importing `~/.ssh/config` makes the jump host its own tunnel; once that
+    /// tunnel has a password, the tunnel jumping through it must not ask again.
+    #[test]
+    fn jump_credentials_are_inherited_from_the_matching_tunnel() {
+        let bastion = TunnelConfig {
+            id: "bastion".into(),
+            name: "dpi-frpc".into(),
+            ssh_host: "10.0.0.1".into(),
+            ssh_port: 22,
+            ssh_user: "root".into(),
+            credentials: password_credentials(),
+            ..TunnelConfig::default()
+        };
+        let target = TunnelConfig {
+            id: "vdi".into(),
+            name: "dpi-vdi".into(),
+            ssh_host: "10.0.0.2".into(),
+            jumps: vec![JumpHost {
+                id: "j1".into(),
+                label: "dpi-frpc".into(),
+                host: "10.0.0.1".into(),
+                port: 22,
+                username: "root".into(),
+                credentials: SshCredentials::default(),
+            }],
+            ..TunnelConfig::default()
+        };
+        let snapshot = DockSnapshot {
+            tunnels: vec![bastion, target.clone()],
+            ..DockSnapshot::default()
+        };
+
+        let resolved = snapshot.with_inherited_jump_credentials(&target);
+        assert!(resolved.jumps[0].credentials.has_secret());
+        assert_eq!(
+            resolved.jumps[0].credentials.password_cipher.as_deref(),
+            Some("v1.iv.data")
+        );
+        // 原始配置不改写：继承只发生在解析出的副本上。
+        assert!(!target.jumps[0].credentials.has_secret());
+    }
+
+    #[test]
+    fn jump_credentials_fall_back_to_endpoint_when_the_label_is_empty() {
+        let bastion = TunnelConfig {
+            id: "bastion".into(),
+            name: "已改名".into(),
+            ssh_host: "10.0.0.1".into(),
+            ssh_port: 2222,
+            ssh_user: "ops".into(),
+            credentials: password_credentials(),
+            ..TunnelConfig::default()
+        };
+        let target = TunnelConfig {
+            id: "vdi".into(),
+            jumps: vec![JumpHost {
+                id: "j1".into(),
+                label: String::new(),
+                host: "10.0.0.1".into(),
+                port: 2222,
+                username: "ops".into(),
+                credentials: SshCredentials::default(),
+            }],
+            ..TunnelConfig::default()
+        };
+        let snapshot = DockSnapshot {
+            tunnels: vec![bastion, target.clone()],
+            ..DockSnapshot::default()
+        };
+        let resolved = snapshot.with_inherited_jump_credentials(&target);
+        assert!(resolved.jumps[0].credentials.has_secret());
+    }
+
+    #[test]
+    fn an_exact_endpoint_match_beats_a_name_match() {
+        let same_name = TunnelConfig {
+            id: "other".into(),
+            name: "dpi-frpc".into(),
+            ssh_host: "198.51.100.7".into(),
+            ssh_port: 22,
+            ssh_user: "root".into(),
+            credentials: SshCredentials {
+                auth_type: AuthType::Password,
+                password_cipher: Some("v1.wrong.data".into()),
+                ..SshCredentials::default()
+            },
+            ..TunnelConfig::default()
+        };
+        let exact = TunnelConfig {
+            id: "exact".into(),
+            name: "另一个名字".into(),
+            ssh_host: "10.0.0.1".into(),
+            ssh_port: 22,
+            ssh_user: "root".into(),
+            credentials: password_credentials(),
+            ..TunnelConfig::default()
+        };
+        let target = TunnelConfig {
+            id: "vdi".into(),
+            jumps: vec![JumpHost {
+                id: "j1".into(),
+                label: "dpi-frpc".into(),
+                host: "10.0.0.1".into(),
+                port: 22,
+                username: "root".into(),
+                credentials: SshCredentials::default(),
+            }],
+            ..TunnelConfig::default()
+        };
+        let snapshot = DockSnapshot {
+            tunnels: vec![same_name, exact, target.clone()],
+            ..DockSnapshot::default()
+        };
+        let resolved = snapshot.with_inherited_jump_credentials(&target);
+        assert_eq!(
+            resolved.jumps[0].credentials.password_cipher.as_deref(),
+            Some("v1.iv.data")
+        );
+    }
+
+    #[test]
+    fn a_jump_with_its_own_secret_is_not_overridden() {
+        let bastion = TunnelConfig {
+            id: "bastion".into(),
+            name: "dpi-frpc".into(),
+            ssh_host: "10.0.0.1".into(),
+            ssh_port: 22,
+            ssh_user: "root".into(),
+            credentials: password_credentials(),
+            ..TunnelConfig::default()
+        };
+        let target = TunnelConfig {
+            id: "vdi".into(),
+            jumps: vec![JumpHost {
+                id: "j1".into(),
+                label: "dpi-frpc".into(),
+                host: "10.0.0.1".into(),
+                port: 22,
+                username: "root".into(),
+                credentials: SshCredentials {
+                    auth_type: AuthType::Password,
+                    password_cipher: Some("v1.own.data".into()),
+                    ..SshCredentials::default()
+                },
+            }],
+            ..TunnelConfig::default()
+        };
+        let snapshot = DockSnapshot {
+            tunnels: vec![bastion, target.clone()],
+            ..DockSnapshot::default()
+        };
+        let resolved = snapshot.with_inherited_jump_credentials(&target);
+        assert_eq!(
+            resolved.jumps[0].credentials.password_cipher.as_deref(),
+            Some("v1.own.data")
+        );
     }
 }

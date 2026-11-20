@@ -266,7 +266,8 @@ impl Runtime {
     /// forward) and closes it. Does not touch running applications.
     pub async fn test_tunnel(&self, id: &str) -> TunnelTestResult {
         let started = Instant::now();
-        let Some(tunnel) = self.store.get_tunnel(id).await else {
+        let snapshot = self.store.snapshot().await;
+        let Some(tunnel) = snapshot.tunnel(id) else {
             return TunnelTestResult {
                 tunnel_id: id.to_string(),
                 state: TestState::Failure,
@@ -276,6 +277,8 @@ impl Runtime {
                 security_alert: false,
             };
         };
+        // 跳板机的凭据可能来自定义同一主机的另一条隧道，测试与真实连接共用同一套解析。
+        let tunnel = snapshot.with_inherited_jump_credentials(tunnel);
         let context = self.connect_context();
         match ssh::probe(&context, &tunnel).await {
             Ok(()) => {
@@ -461,6 +464,8 @@ impl Runtime {
                 .await;
                 break;
             };
+            // 跳板机的凭据可能由另一条隧道提供，连接前统一解析出来。
+            let tunnel = snapshot.with_inherited_jump_credentials(&tunnel);
 
             // Report "connecting" before dialling so the UI never sits on a
             // stale idle/error state while the first attempt is in flight.
