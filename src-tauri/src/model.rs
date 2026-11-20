@@ -663,6 +663,18 @@ pub struct CredentialInput {
     pub password: Option<String>,
     pub private_key: Option<String>,
     pub passphrase: Option<String>,
+    /// `~/.ssh/<name>` 的文件名。设置后由后端读取该文件作为私钥，
+    /// 前端不再接触密钥内容；与 `private_key` 同时出现时以本字段为准。
+    pub private_key_path: Option<String>,
+}
+
+impl CredentialInput {
+    /// 是否声明了“从本机 ~/.ssh 读取私钥”。
+    pub fn uses_local_key(&self) -> bool {
+        self.private_key_path
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

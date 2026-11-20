@@ -3,5 +3,11 @@
   "identifier": "default",
   "description": "TunnelDock 主窗口所需的最小权限",
   "windows": ["main"],
-  "permissions": ["core:default", "autostart:default"]
+  "permissions": [
+    "core:default",
+    "autostart:default",
+    "dialog:allow-save",
+    "dialog:allow-open",
+    "dialog:allow-message"
+  ]
 }

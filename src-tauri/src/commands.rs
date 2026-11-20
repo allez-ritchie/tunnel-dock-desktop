@@ -1,8 +1,10 @@
+use crate::local_ssh::{LocalSshStatus, SshConfigHost};
 use crate::model::{
     new_id, now_millis, AppGroup, AppInput, AppStatus, AppView, AuthType, CredentialInput,
     DockSnapshot, ForwardApp, GroupInput, GroupView, JumpHost, JumpInput, SshCredentials,
     TunnelConfig, TunnelInput, TunnelTestResult, TunnelView, DEFAULT_GROUP_ID,
 };
+use crate::portable::{self, BundlePreview, ExportSummary, ImportSummary};
 use crate::secrets::Secrets;
 use crate::AppState;
 use std::collections::HashSet;
@@ -49,7 +51,7 @@ pub async fn save_tunnel(
         Some(id) => state.store.get_tunnel(id).await,
         None => None,
     };
-    let config = build_tunnel(input, existing.as_ref(), &state.secrets)?;
+    let config = build_tunnel(input, existing.as_ref(), &state.secrets, &state.local_ssh)?;
     let saved = state.runtime.clone().save_tunnel(config).await?;
     crate::sync_autostart(&app).await;
     Ok(TunnelView::from(&saved))
@@ -194,6 +196,271 @@ pub async fn known_hosts_count(state: State<'_, AppState>) -> Result<usize, Stri
     Ok(state.known_hosts.count().await)
 }
 
+// ---------------------------------------------------------------- 本机 ~/.ssh
+
+/// 探测 `~/.ssh`：目录是否存在、有哪些私钥、`config` 里有多少可导入的主机。
+#[tauri::command]
+pub async fn local_ssh_status(state: State<'_, AppState>) -> Result<LocalSshStatus, String> {
+    let local = state.local_ssh.clone();
+    // 目录扫描是同步文件 IO，放到阻塞线程池，避免卡住 Tauri 的命令执行器。
+    tokio::task::spawn_blocking(move || local.scan())
+        .await
+        .map_err(|error| format!("读取 ~/.ssh 失败: {error}"))
+}
+
+/// 列出 `~/.ssh/config` 中带具体 Host 名的条目。
+#[tauri::command]
+pub async fn local_ssh_config_hosts(
+    state: State<'_, AppState>,
+) -> Result<Vec<SshConfigHost>, String> {
+    let local = state.local_ssh.clone();
+    tokio::task::spawn_blocking(move || local.parse_config())
+        .await
+        .map_err(|error| format!("解析 ~/.ssh/config 失败: {error}"))?
+}
+
+/// 把选中的 `Host` 别名导入为隧道。
+///
+/// 只创建尚不存在的别名，已导入过的别名会被跳过，因此重复点击是安全的。
+/// 私钥：`IdentityFile` 指向 `~/.ssh` 内且存在的文件时自动读取；否则留空，
+/// 需要用户在隧道编辑页补充。
+#[tauri::command]
+pub async fn import_local_ssh_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    aliases: Vec<String>,
+) -> Result<Vec<TunnelView>, String> {
+    if aliases.is_empty() {
+        return Err("请先选择要导入的主机".into());
+    }
+    let local = state.local_ssh.clone();
+    let hosts = tokio::task::spawn_blocking(move || local.parse_config())
+        .await
+        .map_err(|error| format!("解析 ~/.ssh/config 失败: {error}"))??;
+
+    let snapshot = state.store.snapshot().await;
+    let mut existing_names: HashSet<String> = snapshot
+        .tunnels
+        .iter()
+        .map(|tunnel| tunnel.name.to_lowercase())
+        .collect();
+    let mut created = Vec::new();
+
+    for alias in aliases {
+        let Some(host) = hosts.iter().find(|item| item.alias == alias) else {
+            continue;
+        };
+        if !host.importable {
+            return Err(format!(
+                "主机“{}”包含暂不支持的配置（{}），请手动创建隧道",
+                host.alias,
+                host.unsupported.as_deref().unwrap_or("unsupported")
+            ));
+        }
+        if existing_names.contains(&host.alias.to_lowercase()) {
+            continue;
+        }
+        let credentials = local_ssh_credentials(host, &state)?;
+        let jumps = build_config_jumps(host, &hosts, &state)?;
+        let config = TunnelConfig {
+            id: new_id(),
+            name: host.alias.clone(),
+            ssh_host: host.host_name.clone(),
+            ssh_port: host.port,
+            ssh_user: host.user.clone(),
+            credentials,
+            jumps,
+            auto_reconnect: true,
+            keep_alive_seconds: crate::model::DEFAULT_KEEPALIVE_SECONDS,
+            connect_timeout_seconds: crate::model::DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            strict_host_key: true,
+            created_at: now_millis(),
+            updated_at: now_millis(),
+        };
+        let saved = state.runtime.clone().save_tunnel(config).await?;
+        existing_names.insert(host.alias.to_lowercase());
+        created.push(TunnelView::from(&saved));
+    }
+
+    crate::sync_autostart(&app).await;
+    Ok(created)
+}
+
+fn local_ssh_credentials(
+    host: &SshConfigHost,
+    state: &State<'_, AppState>,
+) -> Result<SshCredentials, String> {
+    let local = state.local_ssh.clone();
+    let key = host
+        .identity_file
+        .as_deref()
+        .map(|path| resolve_identity_file(&local, path))
+        .transpose()?
+        .flatten();
+    match key {
+        Some(text) => Ok(SshCredentials {
+            auth_type: AuthType::PrivateKey,
+            private_key_cipher: Some(
+                state
+                    .secrets
+                    .encrypt(&text)
+                    .map_err(|error| error.to_string())?,
+            ),
+            ..SshCredentials::default()
+        }),
+        // 没有可用私钥：留空凭据，用户可在隧道编辑页补充。
+        None => Ok(SshCredentials::default()),
+    }
+}
+
+/// 把 `IdentityFile` 解析成 `~/.ssh` 下的真实文件内容。
+/// 相对路径按 `~/.ssh` 解析；`%d` 替换为 home 目录；指向目录外或不存在时返回 `None`。
+fn resolve_identity_file(
+    local: &crate::local_ssh::LocalSsh,
+    raw: &str,
+) -> Result<Option<String>, String> {
+    let expanded = raw.trim().replace("%d", &home_dir().to_string_lossy());
+    let candidate = if expanded.starts_with("~/") || expanded.starts_with("~\\") {
+        home_dir().join(&expanded[2..])
+    } else if expanded.starts_with('~') {
+        home_dir().join(&expanded[1..])
+    } else {
+        let path = std::path::PathBuf::from(&expanded);
+        if path.is_absolute() {
+            path
+        } else {
+            local.root().join(path)
+        }
+    };
+    let canonical = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let Ok(root) = local.root().canonicalize() else {
+        return Ok(None);
+    };
+    if !canonical.starts_with(&root) {
+        return Ok(None);
+    }
+    let Some(name) = canonical.file_name().map(|name| name.to_string_lossy().to_string()) else {
+        return Ok(None);
+    };
+    match local.read_key(&name) {
+        Ok(text) => Ok(Some(text)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// `ProxyJump` 里的别名按链路顺序转成跳板机，凭据沿用各自的 `IdentityFile`。
+fn build_config_jumps(
+    host: &SshConfigHost,
+    hosts: &[SshConfigHost],
+    state: &State<'_, AppState>,
+) -> Result<Vec<JumpHost>, String> {
+    let mut jumps = Vec::with_capacity(host.proxy_jump.len());
+    for alias in &host.proxy_jump {
+        let Some(jump) = hosts.iter().find(|item| item.alias == *alias) else {
+            return Err(format!("跳板机“{alias}”没有在 ~/.ssh/config 中定义"));
+        };
+        jumps.push(JumpHost {
+            id: new_id(),
+            label: jump.alias.clone(),
+            host: jump.host_name.clone(),
+            port: jump.port,
+            username: jump.user.clone(),
+            credentials: local_ssh_credentials(jump, state)?,
+        });
+    }
+    Ok(jumps)
+}
+
+// ------------------------------------------------------------ 配置包导出导入
+
+/// 导出应用组、应用与隧道到 `.zip`。
+#[tauri::command]
+pub async fn export_bundle(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<ExportSummary, String> {
+    let target = check_export_path(&path)?;
+    let snapshot = state.store.snapshot().await;
+    let payload = portable::build_document(&snapshot, &state.secrets)?;
+    let document = payload.document.clone();
+    tokio::task::spawn_blocking(move || portable::write_zip(&target, &document))
+        .await
+        .map_err(|error| format!("导出失败: {error}"))??;
+    tracing::info!(
+        tunnels = payload.document.tunnels.len(),
+        apps = payload.document.apps.len(),
+        groups = payload.document.groups.len(),
+        "已导出配置包"
+    );
+    Ok(payload.summary(&path))
+}
+
+/// 只读取列表，不写入配置，供导入前的确认弹窗使用。
+#[tauri::command]
+pub async fn preview_bundle(path: String) -> Result<BundlePreview, String> {
+    let source = check_import_path(&path)?;
+    let document = tokio::task::spawn_blocking(move || portable::read_zip(&source))
+        .await
+        .map_err(|error| format!("读取配置包失败: {error}"))??;
+    Ok(portable::preview(&document))
+}
+
+/// 把配置包合并进当前配置。不会自动启动转发。
+#[tauri::command]
+pub async fn import_bundle(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<ImportSummary, String> {
+    let source = check_import_path(&path)?;
+    let document = tokio::task::spawn_blocking(move || portable::read_zip(&source))
+        .await
+        .map_err(|error| format!("读取配置包失败: {error}"))??;
+    let summary = portable::apply_import(document, &state.store, &state.secrets).await?;
+    crate::sync_autostart(&app).await;
+    tracing::info!(
+        tunnels = summary.tunnels_added,
+        apps = summary.apps_added,
+        groups = summary.groups_added,
+        "已导入配置包"
+    );
+    Ok(summary)
+}
+
+fn checked_path(path: &str, extension: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("请选择文件路径".into());
+    }
+    let path = std::path::PathBuf::from(trimmed);
+    match path.extension().and_then(|value| value.to_str()) {
+        Some(value) if value.eq_ignore_ascii_case(extension) => Ok(path),
+        _ => Err(format!("请选择 .{extension} 文件")),
+    }
+}
+
+fn check_export_path(path: &str) -> Result<std::path::PathBuf, String> {
+    checked_path(path, "zip")
+}
+
+fn check_import_path(path: &str) -> Result<std::path::PathBuf, String> {
+    let path = checked_path(path, "zip")?;
+    if !path.is_file() {
+        return Err("所选的配置包不存在".into());
+    }
+    Ok(path)
+}
+
 #[tauri::command]
 pub async fn clear_known_hosts(state: State<'_, AppState>) -> Result<(), String> {
     state.known_hosts.clear().await;
@@ -231,11 +498,42 @@ fn merge_secret(
     }
 }
 
+/// `~/.ssh` 下的私钥走“文件名引用”而不是“内容上传”：后端读取文件、加密落盘，
+/// 前端既不读也不缓存密钥内容。文件缺失或不是私钥时回落到 `None`，
+/// 由上层语义决定是保持原值还是报“缺少私钥”。
+fn local_key_secret(
+    file: &str,
+    local_ssh: &crate::local_ssh::LocalSsh,
+    secrets: &Arc<Secrets>,
+) -> Result<Option<String>, String> {
+    let text = local_ssh.read_key(file.trim())?;
+    secrets
+        .encrypt(&text)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 fn merge_credentials(
     existing: &SshCredentials,
     input: &CredentialInput,
     secrets: &Arc<Secrets>,
+    local_ssh: &crate::local_ssh::LocalSsh,
 ) -> Result<SshCredentials, String> {
+    // 只有私钥认证才读取本机文件；切回密码认证时保留原私钥即可。
+    let use_local_key = input.uses_local_key() && input.auth_type == AuthType::PrivateKey;
+    let private_key_cipher = if use_local_key {
+        local_key_secret(
+            input.private_key_path.as_deref().unwrap_or_default(),
+            local_ssh,
+            secrets,
+        )?
+    } else {
+        merge_secret(
+            existing.private_key_cipher.as_ref(),
+            input.private_key.as_ref(),
+            secrets,
+        )?
+    };
     Ok(SshCredentials {
         auth_type: input.auth_type,
         password_cipher: merge_secret(
@@ -243,11 +541,7 @@ fn merge_credentials(
             input.password.as_ref(),
             secrets,
         )?,
-        private_key_cipher: merge_secret(
-            existing.private_key_cipher.as_ref(),
-            input.private_key.as_ref(),
-            secrets,
-        )?,
+        private_key_cipher,
         passphrase_cipher: merge_secret(
             existing.passphrase_cipher.as_ref(),
             input.passphrase.as_ref(),
@@ -260,6 +554,7 @@ fn build_jumps(
     input: &[JumpInput],
     existing: &[JumpHost],
     secrets: &Arc<Secrets>,
+    local_ssh: &crate::local_ssh::LocalSsh,
 ) -> Result<Vec<JumpHost>, String> {
     if input.len() > 8 {
         return Err("最多支持 8 级跳板机".into());
@@ -278,8 +573,18 @@ fn build_jumps(
         let id = jump.id.clone().unwrap_or_else(new_id);
         let previous = existing.iter().find(|item| item.id == id);
         let credentials = match previous {
-            Some(previous) => merge_credentials(&previous.credentials, &jump.credentials, secrets)?,
-            None => merge_credentials(&SshCredentials::default(), &jump.credentials, secrets)?,
+            Some(previous) => merge_credentials(
+                &previous.credentials,
+                &jump.credentials,
+                secrets,
+                local_ssh,
+            )?,
+            None => merge_credentials(
+                &SshCredentials::default(),
+                &jump.credentials,
+                secrets,
+                local_ssh,
+            )?,
         };
         jumps.push(JumpHost {
             id,
@@ -297,6 +602,7 @@ fn build_tunnel(
     input: TunnelInput,
     existing: Option<&TunnelConfig>,
     secrets: &Arc<Secrets>,
+    local_ssh: &crate::local_ssh::LocalSsh,
 ) -> Result<TunnelConfig, String> {
     let name = input.name.trim();
     if name.is_empty() {
@@ -336,13 +642,19 @@ fn build_tunnel(
         ssh_host: input.ssh_host.trim().to_string(),
         ssh_port: input.ssh_port,
         ssh_user: input.ssh_user.trim().to_string(),
-        credentials: merge_credentials(&previous_credentials, &input.credentials, secrets)?,
+        credentials: merge_credentials(
+            &previous_credentials,
+            &input.credentials,
+            secrets,
+            local_ssh,
+        )?,
         jumps: build_jumps(
             &input.jumps,
             existing
                 .map(|config| config.jumps.as_slice())
                 .unwrap_or(&[]),
             secrets,
+            local_ssh,
         )?,
         auto_reconnect: input.auto_reconnect,
         keep_alive_seconds: input.keep_alive_seconds,
@@ -492,11 +804,18 @@ mod tests {
         }
     }
 
+    /// 测试不依赖真实的 `~/.ssh`，因此始终指向一个空的临时目录。
+    fn local_ssh() -> crate::local_ssh::LocalSsh {
+        let dir = std::env::temp_dir().join("tunneldock-test-ssh");
+        let _ = std::fs::create_dir_all(&dir);
+        crate::local_ssh::LocalSsh::at(dir)
+    }
+
     #[tokio::test]
     async fn accepts_valid_tunnel_and_encrypts_secret() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let config = build_tunnel(tunnel_input(), None, &vault).unwrap();
+        let config = build_tunnel(tunnel_input(), None, &vault, &local_ssh()).unwrap();
         assert_eq!(config.name, "NAS");
         let cipher = config.credentials.password_cipher.unwrap();
         assert_eq!(vault.decrypt(&cipher).unwrap(), "s3cret");
@@ -508,7 +827,7 @@ mod tests {
         let vault = Secrets::load(dir.path()).unwrap();
         let mut candidate = tunnel_input();
         candidate.jumps = (0..9).map(jump).collect();
-        let error = build_tunnel(candidate, None, &vault).unwrap_err();
+        let error = build_tunnel(candidate, None, &vault, &local_ssh()).unwrap_err();
         assert!(error.contains("8 级"), "unexpected: {error}");
     }
 
@@ -518,7 +837,7 @@ mod tests {
         let vault = Secrets::load(dir.path()).unwrap();
         let mut candidate = tunnel_input();
         candidate.credentials.password = None;
-        let error = build_tunnel(candidate, None, &vault).unwrap_err();
+        let error = build_tunnel(candidate, None, &vault, &local_ssh()).unwrap_err();
         assert!(error.contains("密码"), "unexpected: {error}");
     }
 
@@ -526,13 +845,13 @@ mod tests {
     async fn keeps_stored_secret_when_input_is_null() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let existing = build_tunnel(tunnel_input(), None, &vault).unwrap();
+        let existing = build_tunnel(tunnel_input(), None, &vault, &local_ssh()).unwrap();
 
         let mut edit = tunnel_input();
         edit.id = Some(existing.id.clone());
         edit.name = "NAS 2".into();
         edit.credentials.password = None; // null keeps the stored value
-        let updated = build_tunnel(edit, Some(&existing), &vault).unwrap();
+        let updated = build_tunnel(edit, Some(&existing), &vault, &local_ssh()).unwrap();
         assert_eq!(updated.name, "NAS 2");
         assert_eq!(
             updated.credentials.password_cipher,
@@ -544,7 +863,7 @@ mod tests {
     async fn switching_auth_type_and_clearing_password_drops_the_cipher() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let existing = build_tunnel(tunnel_input(), None, &vault).unwrap();
+        let existing = build_tunnel(tunnel_input(), None, &vault, &local_ssh()).unwrap();
 
         let mut edit = tunnel_input();
         edit.id = Some(existing.id.clone());
@@ -553,8 +872,9 @@ mod tests {
             password: Some(String::new()),
             private_key: Some("-----BEGIN OPENSSH PRIVATE KEY-----".into()),
             passphrase: None,
+            private_key_path: None,
         };
-        let updated = build_tunnel(edit, Some(&existing), &vault).unwrap();
+        let updated = build_tunnel(edit, Some(&existing), &vault, &local_ssh()).unwrap();
         assert_eq!(updated.credentials.auth_type, AuthType::PrivateKey);
         assert!(updated.credentials.password_cipher.is_none());
         assert!(updated.credentials.private_key_cipher.is_some());
@@ -567,18 +887,18 @@ mod tests {
 
         let mut short_keepalive = tunnel_input();
         short_keepalive.keep_alive_seconds = 4;
-        assert!(build_tunnel(short_keepalive, None, &vault).is_err());
+        assert!(build_tunnel(short_keepalive, None, &vault, &local_ssh()).is_err());
 
         let mut long_timeout = tunnel_input();
         long_timeout.connect_timeout_seconds = 121;
-        assert!(build_tunnel(long_timeout, None, &vault).is_err());
+        assert!(build_tunnel(long_timeout, None, &vault, &local_ssh()).is_err());
     }
 
     #[tokio::test]
     async fn app_requires_an_existing_group_and_tunnel() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let tunnel = build_tunnel(tunnel_input(), None, &vault).unwrap();
+        let tunnel = build_tunnel(tunnel_input(), None, &vault, &local_ssh()).unwrap();
         let snapshot = snapshot(&tunnel);
 
         assert!(build_app(app_input(&tunnel.id), None, &snapshot).is_ok());
@@ -598,7 +918,7 @@ mod tests {
     async fn app_validates_ports_and_browser_url() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let tunnel = build_tunnel(tunnel_input(), None, &vault).unwrap();
+        let tunnel = build_tunnel(tunnel_input(), None, &vault, &local_ssh()).unwrap();
         let snapshot = snapshot(&tunnel);
 
         let mut low_port = app_input(&tunnel.id);
@@ -615,10 +935,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn imports_private_key_from_local_ssh_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let ssh_dir = dir.path().join("ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let key_body = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+        std::fs::write(ssh_dir.join("id_ed25519"), key_body).unwrap();
+        let local = crate::local_ssh::LocalSsh::at(&ssh_dir);
+
+        let mut input = tunnel_input();
+        input.credentials = CredentialInput {
+            auth_type: AuthType::PrivateKey,
+            private_key_path: Some("id_ed25519".into()),
+            ..CredentialInput::default()
+        };
+        let config = build_tunnel(input, None, &vault, &local).unwrap();
+        let cipher = config.credentials.private_key_cipher.unwrap();
+        assert_eq!(vault.decrypt(&cipher).unwrap(), key_body);
+        assert!(config.credentials.password_cipher.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_local_key_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut input = tunnel_input();
+        input.credentials = CredentialInput {
+            auth_type: AuthType::PrivateKey,
+            private_key_path: Some("nope".into()),
+            ..CredentialInput::default()
+        };
+        let error = build_tunnel(input, None, &vault, &local_ssh()).unwrap_err();
+        assert!(error.contains("私钥"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn export_path_requires_a_zip_extension() {
+        assert!(check_export_path("").is_err());
+        assert!(check_export_path("backup.json").is_err());
+        assert!(check_export_path("backup.zip").is_ok());
+        assert!(check_import_path("missing.zip").is_err());
+    }
+
+    #[tokio::test]
     async fn app_keeps_desired_and_created_at_on_edit() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let tunnel = build_tunnel(tunnel_input(), None, &vault).unwrap();
+        let tunnel = build_tunnel(tunnel_input(), None, &vault, &local_ssh()).unwrap();
         let snapshot = snapshot(&tunnel);
         let existing = ForwardApp {
             name: "Web".into(),

@@ -149,6 +149,18 @@ impl Store {
             .any(|app| app.auto_start_on_boot)
     }
 
+    /// 用一份完整的配置文档替换当前内容（导入配置包用）。
+    ///
+    /// 一次性落盘，因此导入中途失败不会留下“建了组却没建应用”的半份配置；
+    /// `tunnels.json` 仍是原子替换写入。
+    pub async fn replace_all(&self, snapshot: DockSnapshot) -> Result<DockSnapshot, StoreError> {
+        let next = snapshot.normalized();
+        let mut guard = self.snapshot.write().await;
+        self.persist(&next).await?;
+        *guard = next.clone();
+        Ok(next)
+    }
+
     async fn mutate<F>(&self, transform: F) -> Result<(), StoreError>
     where
         F: FnOnce(&mut DockSnapshot),

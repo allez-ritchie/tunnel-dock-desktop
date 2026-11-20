@@ -1,12 +1,15 @@
 mod commands;
 mod known_hosts;
+mod local_ssh;
 mod model;
+mod portable;
 mod runtime;
 mod secrets;
 mod ssh;
 mod store;
 
 use known_hosts::KnownHosts;
+use local_ssh::LocalSsh;
 use runtime::Runtime;
 use secrets::Secrets;
 use std::sync::Arc;
@@ -20,6 +23,7 @@ pub struct AppState {
     pub secrets: Arc<Secrets>,
     pub known_hosts: Arc<KnownHosts>,
     pub runtime: Arc<Runtime>,
+    pub local_ssh: LocalSsh,
 }
 
 pub(crate) async fn sync_autostart(app: &AppHandle) {
@@ -115,6 +119,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let data_dir = app.path().app_data_dir()?;
@@ -136,6 +141,7 @@ pub fn run() {
                 secrets,
                 known_hosts,
                 runtime: runtime.clone(),
+                local_ssh: LocalSsh::detect(),
             });
 
             setup_tray(app)?;
@@ -168,6 +174,12 @@ pub fn run() {
             commands::stop_group,
             commands::save_group,
             commands::delete_group,
+            commands::local_ssh_status,
+            commands::local_ssh_config_hosts,
+            commands::import_local_ssh_config,
+            commands::export_bundle,
+            commands::preview_bundle,
+            commands::import_bundle,
             commands::known_hosts_count,
             commands::clear_known_hosts,
             commands::open_url,

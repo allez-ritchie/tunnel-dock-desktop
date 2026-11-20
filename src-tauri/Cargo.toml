@@ -16,6 +16,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
+# 导出 / 导入配置包时用到的原生文件选择框（保存、打开）。
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -36,6 +38,8 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 open = "5"
+# 只导出/导入我们自己写的清单文件，因此只需要 deflate，不引入加密、zstd、lzma 等特性。
+zip = { version = "7", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
