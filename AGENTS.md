@@ -57,6 +57,10 @@
 
 环境要求：Node.js 20+、Rust 1.85+、Linux 需要 `libwebkit2gtk-4.1-dev`、
 `libayatana-appindicator3-dev`、`librsvg2-dev`、`libssl-dev` 等 Tauri 系统依赖。
+Windows 需要 MSVC 生成工具；`aws-lc-sys` 在 Windows x86-64 上原本要求 NASM，已在
+`src-tauri/Cargo.toml` 为 `aws-lc-rs` 开启 `prebuilt-nasm` 特性，未装 NASM 时回退到
+crate 内置的预编译汇编对象，不要为绕过构建失败而安装/依赖本机 NASM。Windows 构建还依赖
+`src-tauri/icons/icon.ico`（由 `npm run tauri icon` 从 PNG 生成，需随仓库提交）。
 
 ```bash
 # 安装前端依赖

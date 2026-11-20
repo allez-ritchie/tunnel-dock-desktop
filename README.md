@@ -53,6 +53,16 @@
 `libwebkit2gtk-4.1-dev`、`libayatana-appindicator3-dev`、`librsvg2-dev`、`libssl-dev`、
 `build-essential`、`pkg-config` 等。
 
+Windows 还需要 **MSVC 生成工具**（Visual Studio Build Tools，含 C++ 工作负载）。
+`russh` 通过 `aws-lc-rs` 引入 `aws-lc-sys`，后者在 Windows x86-64 上编译汇编文件需要
+NASM 汇编器；本项目已在 `src-tauri/Cargo.toml` 中为 `aws-lc-rs` 打开 `prebuilt-nasm`
+特性，未安装 NASM 时会自动回退到 crate 内置的预编译汇编对象，因此**无需单独安装 NASM**。
+如果环境里装了 NASM，构建仍会优先使用它。
+
+Windows 打包/构建还需要 `src-tauri/icons/icon.ico`（用于生成 Windows 资源文件）。
+该文件由 `npm run tauri icon src-tauri/icons/icon.png` 从现有 PNG 生成，已随仓库提供；
+更换应用图标后请重新执行该命令，不要手写 `.ico`。
+
 ```bash
 npm install
 
