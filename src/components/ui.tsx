@@ -431,7 +431,11 @@ export function SecureNotice({ text }: { text: string }) {
 
 export type NavTab = "apps" | "tunnels" | "settings";
 
-export function BottomNav({
+/**
+ * 左侧垂直导航。桌面窗口宽大于高，纵向空间宝贵，因此把「应用 / 隧道 / 设置」
+ * 改为左侧竖排的 tab，页面内容独占右侧的整块区域。
+ */
+export function SideNav({
   tab,
   onChange,
 }: {
@@ -444,17 +448,17 @@ export function BottomNav({
     { value: "settings", label: strings.tabSettings, icon: "settings" },
   ];
   return (
-    <nav className="bottom-nav" aria-label={strings.appName}>
+    <nav className="side-nav" aria-label={strings.appName}>
       {items.map((item) => (
         <button
           key={item.value}
           type="button"
-          className={`bottom-nav-item${tab === item.value ? " is-active" : ""}`}
+          className={`side-nav-item${tab === item.value ? " is-active" : ""}`}
           aria-current={tab === item.value ? "page" : undefined}
           onClick={() => onChange(item.value)}
         >
           <Icon name={item.icon} size={20} />
-          <span>{item.label}</span>
+          <span className="side-nav-label">{item.label}</span>
         </button>
       ))}
     </nav>

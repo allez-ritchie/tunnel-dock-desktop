@@ -9,7 +9,7 @@ import {
   type GroupView,
   type TunnelInput,
 } from "./api";
-import { BottomNav, Icon, Modal, type NavTab } from "./components/ui";
+import { Icon, Modal, SideNav, type NavTab } from "./components/ui";
 import { AppsScreen } from "./screens/AppsScreen";
 import { AppEditorScreen } from "./screens/AppEditorScreen";
 import { ErrorDetailScreen } from "./screens/ErrorDetailScreen";
@@ -423,87 +423,87 @@ export default function App() {
 
   return (
     <main className="app-root">
-      <div className={overlays.length > 0 ? "tab-pages is-hidden" : "tab-pages"}>
-        {tab === "apps" ? (
-          <AppsScreen
-            apps={dock.apps}
-            tunnels={dock.tunnels}
-            groups={dock.groups}
-            statuses={statuses}
-            collapsedGroups={collapsedGroups}
-            onToggleGroup={toggleGroup}
-            onStartApp={(id) => void run(() => api.startApp(id))}
-            onStopApp={(id) => void run(() => api.stopApp(id))}
-            onRestartApp={(id) => void run(() => api.restartApp(id))}
-            onEditApp={openEditApp}
-            onDeleteApp={(id) => void run(() => deleteApp(id))}
-            onOpenError={openError}
-            onOpenBrowser={openBrowser}
-            onCopy={copy}
-            onStartGroup={(id) => void run(() => api.startGroup(id))}
-            onStopGroup={(id) => void run(() => api.stopGroup(id))}
-            onCreateApp={openCreateApp}
-            onCreateTunnel={openCreateTunnel}
-            onCreateGroup={() => setGroupDialog("new")}
-            onRenameGroup={(group) => setGroupDialog(group)}
-            onDeleteGroup={(group) => void run(() => deleteGroup(group))}
-          />
-        ) : null}
+      <SideNav tab={tab} onChange={selectTab} />
 
-        {tab === "tunnels" ? (
-          <TunnelsScreen
-            tunnels={dock.tunnels}
-            apps={dock.apps}
-            statuses={statuses}
-            tests={tests}
-            onTest={(id) => void testTunnel(id)}
-            onEdit={openEditTunnel}
-            onDelete={(id) => void run(() => deleteTunnel(id))}
-            onCreate={openCreateTunnel}
-            onImportSshConfig={openSshConfigImport}
-          />
-        ) : null}
+      <div className="app-main">
+        <div className={overlays.length > 0 ? "tab-pages is-hidden" : "tab-pages"}>
+          {tab === "apps" ? (
+            <AppsScreen
+              apps={dock.apps}
+              tunnels={dock.tunnels}
+              groups={dock.groups}
+              statuses={statuses}
+              collapsedGroups={collapsedGroups}
+              onToggleGroup={toggleGroup}
+              onStartApp={(id) => void run(() => api.startApp(id))}
+              onStopApp={(id) => void run(() => api.stopApp(id))}
+              onRestartApp={(id) => void run(() => api.restartApp(id))}
+              onEditApp={openEditApp}
+              onDeleteApp={(id) => void run(() => deleteApp(id))}
+              onOpenError={openError}
+              onOpenBrowser={openBrowser}
+              onCopy={copy}
+              onStartGroup={(id) => void run(() => api.startGroup(id))}
+              onStopGroup={(id) => void run(() => api.stopGroup(id))}
+              onCreateApp={openCreateApp}
+              onCreateTunnel={openCreateTunnel}
+              onCreateGroup={() => setGroupDialog("new")}
+              onRenameGroup={(group) => setGroupDialog(group)}
+              onDeleteGroup={(group) => void run(() => deleteGroup(group))}
+            />
+          ) : null}
 
-        {tab === "settings" ? (
-          <SettingsScreen
-            theme={theme}
-            knownHostsCount={knownHostsCount}
-            autostart={autostart}
-            version={version}
-            tunnelCount={dock.tunnels.length}
-            appCount={dock.apps.length}
-            groupCount={dock.groups.length}
-            onThemeChange={setTheme}
-            onClearKnownHosts={async () => {
-              await api.clearKnownHosts();
-              await refreshKnownHosts();
-            }}
-            onMessage={notify}
-            onImported={async () => {
-              await refreshDock();
-              await refreshKnownHosts();
-            }}
-          />
-        ) : null}
-      </div>
+          {tab === "tunnels" ? (
+            <TunnelsScreen
+              tunnels={dock.tunnels}
+              apps={dock.apps}
+              statuses={statuses}
+              tests={tests}
+              onTest={(id) => void testTunnel(id)}
+              onEdit={openEditTunnel}
+              onDelete={(id) => void run(() => deleteTunnel(id))}
+              onCreate={openCreateTunnel}
+              onImportSshConfig={openSshConfigImport}
+            />
+          ) : null}
 
-      {overlays.map((overlay, index) => (
-        <div
-          key={overlay.key}
-          className={
-            index === overlays.length - 1
-              ? "overlay-screen"
-              : "overlay-screen is-hidden"
-          }
-          aria-hidden={index !== overlays.length - 1}
-        >
-          {renderOverlay(overlay)}
+          {tab === "settings" ? (
+            <SettingsScreen
+              theme={theme}
+              knownHostsCount={knownHostsCount}
+              autostart={autostart}
+              version={version}
+              tunnelCount={dock.tunnels.length}
+              appCount={dock.apps.length}
+              groupCount={dock.groups.length}
+              onThemeChange={setTheme}
+              onClearKnownHosts={async () => {
+                await api.clearKnownHosts();
+                await refreshKnownHosts();
+              }}
+              onMessage={notify}
+              onImported={async () => {
+                await refreshDock();
+                await refreshKnownHosts();
+              }}
+            />
+          ) : null}
         </div>
-      ))}
 
-      {overlays.length === 0 ? (
-        <BottomNav tab={tab} onChange={selectTab} />
-      ) : null}
+        {overlays.map((overlay, index) => (
+          <div
+            key={overlay.key}
+            className={
+              index === overlays.length - 1
+                ? "overlay-screen"
+                : "overlay-screen is-hidden"
+            }
+            aria-hidden={index !== overlays.length - 1}
+          >
+            {renderOverlay(overlay)}
+          </div>
+        ))}
+      </div>
 
       {groupDialog ? (
         <GroupDialog

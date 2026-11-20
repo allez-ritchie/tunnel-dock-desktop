@@ -28,6 +28,8 @@
   --chip-bg: #162336;
   --glow: #2dd4bf;
   --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+  /* 左侧导航宽度；内容区、toast 与浮层都按它做偏移。 */
+  --side-nav-width: 196px;
 }
 
 :root[data-theme="light"] {
@@ -124,7 +126,15 @@ button:disabled {
 }
 
 .app-root {
+  display: flex;
+  align-items: stretch;
   min-height: 100vh;
+}
+
+/* 左侧导航之外的页面列：宽度自适应，滚动与遮罩都限制在这一列内。 */
+.app-main {
+  flex: 1;
+  min-width: 0;
 }
 
 .screen {
@@ -1479,8 +1489,8 @@ button:disabled {
 
 .toast {
   position: fixed;
-  left: 50%;
-  bottom: 96px;
+  left: calc(50% + var(--side-nav-width) / 2);
+  bottom: 28px;
   z-index: 60;
   transform: translateX(-50%);
   padding: 10px 18px;
@@ -1505,7 +1515,7 @@ button:disabled {
 }
 
 
-/* ---------- app shell: pages, bottom navigation ---------- */
+/* ---------- app shell: pages, left side navigation ---------- */
 
 .tab-pages {
   min-height: 100vh;
@@ -1520,7 +1530,7 @@ button:disabled {
 }
 
 .tab-screen {
-  padding-bottom: 122px;
+  padding-bottom: 44px;
 }
 
 .page-header {
@@ -1553,48 +1563,56 @@ button:disabled {
   flex-wrap: wrap;
 }
 
-.bottom-nav {
-  position: fixed;
-  left: 50%;
-  bottom: 18px;
-  z-index: 40;
-  display: flex;
-  gap: 6px;
-  padding: 7px;
-  transform: translateX(-50%);
-  border-radius: 18px;
-  border: 1px solid var(--border-strong);
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
-  backdrop-filter: blur(18px);
-  box-shadow: var(--shadow);
-}
-
-.bottom-nav-item {
+/* 桌面窗口横向更宽，导航竖排在左侧；宽度固定，内容区只负责纵向滚动。 */
+.side-nav {
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  flex: none;
   display: flex;
   flex-direction: column;
+  gap: 4px;
+  width: var(--side-nav-width);
+  height: 100vh;
+  padding: 18px 12px;
+  border-right: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 62%, transparent);
+  backdrop-filter: blur(18px);
+  z-index: 30;
+}
+
+.side-nav-item {
+  display: flex;
   align-items: center;
-  gap: 3px;
-  min-width: 86px;
-  padding: 8px 18px;
+  gap: 11px;
+  width: 100%;
+  padding: 11px 13px;
   border: 0;
-  border-radius: 13px;
+  border-radius: 12px;
   background: transparent;
   color: var(--text-dim);
-  font-size: 11.5px;
+  font-size: 13px;
   font-weight: 550;
+  text-align: left;
   transition:
     color 0.16s ease,
     background 0.16s ease;
 }
 
-.bottom-nav-item:hover {
+.side-nav-item:hover {
   color: var(--text);
   background: color-mix(in srgb, var(--text) 6%, transparent);
 }
 
-.bottom-nav-item.is-active {
+.side-nav-item.is-active {
   color: var(--primary);
   background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
+.side-nav-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 button:focus-visible {
@@ -1603,7 +1621,7 @@ button:focus-visible {
 }
 
 .group-toggle:focus-visible,
-.bottom-nav-item:focus-visible {
+.side-nav-item:focus-visible {
   outline-offset: -2px;
   border-radius: 10px;
 }
@@ -2175,6 +2193,10 @@ button:focus-visible {
 /* ---------- responsive ---------- */
 
 @media (max-width: 760px) {
+  :root {
+    --side-nav-width: 64px;
+  }
+
   .screen {
     padding: 18px 18px 30px;
   }
@@ -2278,17 +2300,30 @@ button:focus-visible {
     margin-left: 0;
   }
 
-  .bottom-nav {
-    left: 12px;
-    right: 12px;
-    justify-content: space-around;
-    transform: none;
+  .side-nav {
+    padding: 14px 8px;
   }
 
-  .bottom-nav-item {
-    flex: 1;
-    min-width: 0;
-    padding: 8px 10px;
+  .side-nav-item {
+    position: relative;
+    justify-content: center;
+    padding: 11px 0;
+  }
+
+  /* 窄窗口只剩图标，文字仍留在 DOM 里供读屏使用。 */
+  .side-nav-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .toast {
+    left: calc(50% + 32px);
   }
 }
 
