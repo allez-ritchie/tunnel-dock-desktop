@@ -173,6 +173,91 @@ export const strings = {
   jumpSave: "保存跳板机",
   jumpHelp: "跳板机按链路顺序连接，凭据同样使用 AES-256-GCM 加密。",
 
+  // ------------------------------------------------------- local ~/.ssh keys
+  localKeyUse: "使用 ~/.ssh 中的私钥",
+  localKeyPick: "不使用本机私钥（手动粘贴）",
+  localKeyLoading: "正在读取 ~/.ssh…",
+  localKeyNone: "未找到 ~/.ssh 目录，仅能手动粘贴私钥。",
+  localKeyEmpty: "~/.ssh 下没有可用的私钥文件。",
+  localKeySelected: (name: string) => `已选择 ~/.ssh/${name}，保存时由本机读取并加密。`,
+  localKeyEncrypted: "带口令",
+  localKeyApplyHint: "保存后该隧道改用所选私钥认证，原有密码将被清除。",
+  localKeyLoadFailed: (message: string) => `无法读取 ~/.ssh：${message}`,
+
+  // --------------------------------------------------- ~/.ssh/config import
+  sshConfigTitle: "导入 ~/.ssh/config",
+  sshConfigKicker: "SSH CONFIG",
+  sshConfigSubtitle: "把 OpenSSH 客户端配置中的主机一次性导入为隧道",
+  sshConfigEntry: "导入 ~/.ssh/config",
+  sshConfigMissing: "没有找到 ~/.ssh/config。",
+  sshConfigMissingHint:
+    "该文件由 OpenSSH 客户端使用。如果本机用系统 ssh 命令管理主机，把配置放在 ~/.ssh/config 后即可导入。",
+  sshConfigFound: (total: number, importable: number) =>
+    total === importable
+      ? `共 ${total} 个主机，全部可直接导入`
+      : `共 ${total} 个主机，其中 ${importable} 个可直接导入`,
+  sshConfigEmpty: "~/.ssh/config 中没有可导入的 Host 条目。",
+  sshConfigImportableLabel: "可导入",
+  sshConfigUnsupportedLabel: "不支持",
+  sshConfigSelectedLabel: "已选择",
+  sshConfigFooterHint:
+    "导入只创建隧道，不会连接服务器。私钥口令需要在隧道编辑页单独填写。",
+  sshConfigSelectAll: "全选可导入项",
+  sshConfigClear: "清除选择",
+  sshConfigSelected: (count: number) => `已选择 ${count} 个主机`,
+  sshConfigImport: "导入所选主机",
+  sshConfigImporting: "导入中…",
+  sshConfigImported: (count: number) => `已导入 ${count} 条隧道`,
+  sshConfigAlreadyExists: "同名隧道已存在，将跳过",
+  sshConfigNoKey: "未找到私钥，导入后需补充",
+  sshConfigKeyFound: (name: string) => `私钥 ${name}`,
+  sshConfigUnsupported: (reason: string) => `暂不支持：${reason}`,
+  sshConfigUnsupportedProxyCommand: "ProxyCommand",
+  sshConfigUnsupportedInclude: "Include",
+  sshConfigUnsupportedMatch: "Match",
+  sshConfigUnsupportedProxyJump: "跳板机未在 config 中定义",
+  sshConfigJumpChain: (count: number) => `${count} 级跳板`,
+  sshConfigSelectedNone: "请先选择要导入的主机",
+  sshConfigBack: "返回",
+
+  // ------------------------------------------------------- bundle export/import
+  settingsBundle: "配置包",
+  settingsBundleDesc: "导出 / 导入应用组、应用与隧道",
+  settingsBundleCounts: (tunnels: number, apps: number, groups: number) =>
+    `将导出 ${groups} 个应用组、${apps} 个应用、${tunnels} 条隧道`,
+  settingsBundleExport: "导出为 .zip",
+  settingsBundleExporting: "导出中…",
+  settingsBundleImport: "导入 .zip",
+  settingsBundleImporting: "导入中…",
+  settingsBundleNote:
+    "配置包使用明文私钥，便于在其他设备还原；请像保管私钥一样保管导出的文件。",
+  settingsBundleExported: (tunnels: number, apps: number, groups: number) =>
+    `已导出 ${groups} 个应用组、${apps} 个应用、${tunnels} 条隧道`,
+  settingsBundleExportSkipped: (names: string) =>
+    `使用密码认证的隧道未导出密码：${names}。导入后需重新填写。`,
+  settingsBundleExportDialog: "导出配置包",
+  settingsBundleImportDialog: "选择配置包",
+  settingsBundleFlexibleNote:
+    "应用组、应用、隧道会按名称合并到现有配置；同名项不会重复创建。",
+  bundlePreviewTitle: "导入配置包？",
+  bundlePreviewBody: (tunnels: number, apps: number, groups: number) =>
+    `配置包里有 ${groups} 个应用组、${apps} 个应用、${tunnels} 条隧道。`,
+  bundlePreviewMissingKeys: (count: number) =>
+    `其中 ${count} 条隧道不含私钥，导入后需要手动补充凭据。`,
+  bundlePreviewConflictHint:
+    "已存在的同名应用会被跳过；不会自动启动任何转发。",
+  bundlePreviewConfirm: "导入并合并",
+  bundleImported: (tunnels: number, apps: number, groups: number) =>
+    `已导入 ${groups} 个应用组、${apps} 个应用、${tunnels} 条隧道`,
+  bundleImportedSkipped: (apps: number, dropped: number) =>
+    `跳过 ${apps} 个同名应用，${dropped} 个应用因引用缺失未导入`,
+  bundleImportedConflicts: (names: string) =>
+    `以下应用与现有应用端口冲突，需要更换端口：${names}`,
+  bundleImportedNoKey: (count: number) =>
+    `${count} 条隧道没有私钥，请到隧道页补充凭据后再连接。`,
+  bundleEmpty: "当前没有可导出的配置。",
+  bundleReadFailed: (message: string) => `读取配置包失败：${message}`,
+
   // ------------------------------------------------------------ app editor
   appEditorNew: "新建应用",
   appEditorEdit: "编辑应用",

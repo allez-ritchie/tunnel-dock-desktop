@@ -1,6 +1,7 @@
 import { useRef, useState, type ReactNode } from "react";
 import type { AppView, AuthType, TunnelInput, TunnelView } from "../api";
 import { Icon, Modal, SecureNotice, WarningBox } from "../components/ui";
+import { LocalKeyPicker } from "../components/LocalKeyPicker";
 import {
   MAX_JUMPS,
   chainPreview,
@@ -13,6 +14,7 @@ import {
   toTunnelInput,
   tunnelFormFrom,
   validateTunnel,
+  usesLocalKey,
   type FormErrors,
   type JumpForm,
   type TunnelForm,
@@ -198,25 +200,35 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
             </div>
           ) : (
             <div className="secret-block">
-              <Field
-                label={
-                  hasSavedPrivateKey(form)
-                    ? strings.editorPrivateKeySaved
-                    : strings.editorPrivateKey
-                }
-                placeholder={
-                  hasSavedPrivateKey(form)
-                    ? strings.editorSecretKeepHint
-                    : strings.editorPrivateKeyHint
-                }
-                value={form.privateKeyInput}
-                multiline
-                error={errors.privateKey}
-                onChange={(value) => {
-                  patch({ privateKeyInput: value, privateKeyCleared: false });
+              <LocalKeyPicker
+                value={form.privateKeyPath}
+                hasSavedKey={hasSavedPrivateKey(form)}
+                onChange={(name) => {
+                  patch({ privateKeyPath: name });
                   setErrors(({ privateKey: _key, ...rest }) => rest);
                 }}
               />
+              {usesLocalKey(form) ? null : (
+                <Field
+                  label={
+                    hasSavedPrivateKey(form)
+                      ? strings.editorPrivateKeySaved
+                      : strings.editorPrivateKey
+                  }
+                  placeholder={
+                    hasSavedPrivateKey(form)
+                      ? strings.editorSecretKeepHint
+                      : strings.editorPrivateKeyHint
+                  }
+                  value={form.privateKeyInput}
+                  multiline
+                  error={errors.privateKey}
+                  onChange={(value) => {
+                    patch({ privateKeyInput: value, privateKeyCleared: false });
+                    setErrors(({ privateKey: _key, ...rest }) => rest);
+                  }}
+                />
+              )}
               <Field
                 label={
                   hasSavedPassphrase(form)
@@ -240,6 +252,7 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
                     patch({
                       privateKeyInput: "",
                       privateKeyCleared: true,
+                      privateKeyPath: null,
                       passphraseInput: "",
                       passphraseCleared: true,
                     })
@@ -708,23 +721,30 @@ function JumpDialog({
           />
         ) : (
           <>
-            <Field
-              label={
-                hasSavedPrivateKey(jump)
-                  ? strings.jumpPrivateKeySaved
-                  : strings.jumpPrivateKey
-              }
-              placeholder={
-                hasSavedPrivateKey(jump)
-                  ? strings.editorSecretKeepHint
-                  : strings.editorPrivateKeyHint
-              }
-              value={jump.privateKeyInput}
-              multiline
-              onChange={(value) =>
-                patch({ privateKeyInput: value, privateKeyCleared: false })
-              }
+            <LocalKeyPicker
+              value={jump.privateKeyPath}
+              hasSavedKey={hasSavedPrivateKey(jump)}
+              onChange={(name) => patch({ privateKeyPath: name })}
             />
+            {usesLocalKey(jump) ? null : (
+              <Field
+                label={
+                  hasSavedPrivateKey(jump)
+                    ? strings.jumpPrivateKeySaved
+                    : strings.jumpPrivateKey
+                }
+                placeholder={
+                  hasSavedPrivateKey(jump)
+                    ? strings.editorSecretKeepHint
+                    : strings.editorPrivateKeyHint
+                }
+                value={jump.privateKeyInput}
+                multiline
+                onChange={(value) =>
+                  patch({ privateKeyInput: value, privateKeyCleared: false })
+                }
+              />
+            )}
             <Field
               label={strings.jumpPassphrase}
               value={jump.passphraseInput}

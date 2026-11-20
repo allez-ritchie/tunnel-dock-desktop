@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { BrandMark, ConfirmDialog, Icon, SecureNotice } from "../components/ui";
+import { BundleCard } from "./BundleCard";
 import { strings, type ThemeMode } from "../strings";
 
 interface Props {
@@ -13,6 +14,8 @@ interface Props {
   onThemeChange: (theme: ThemeMode) => void;
   onClearKnownHosts: () => Promise<void>;
   onMessage: (text: string) => void;
+  /** 导入配置包后刷新配置与计数。 */
+  onImported: () => Promise<void>;
 }
 
 export function SettingsScreen({
@@ -26,6 +29,7 @@ export function SettingsScreen({
   onThemeChange,
   onClearKnownHosts,
   onMessage,
+  onImported,
 }: Props) {
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -91,6 +95,14 @@ export function SettingsScreen({
           </p>
           <p className="field-hint">{strings.settingsDataHint}</p>
         </SettingsCard>
+
+        <BundleCard
+          tunnelCount={tunnelCount}
+          appCount={appCount}
+          groupCount={groupCount}
+          onMessage={onMessage}
+          onImported={onImported}
+        />
 
         <SettingsCard
           icon={<Icon name="sun" size={20} />}

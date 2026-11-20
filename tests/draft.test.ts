@@ -16,6 +16,7 @@ import {
   toAppInput,
   toTunnelInput,
   tunnelFormFrom,
+  usesLocalKey,
   validateApp,
   validateTunnel,
   type AppForm,
@@ -215,6 +216,15 @@ describe("validateTunnel", () => {
     expect(errors.privateKey).toBe(strings.errorPrivateKeyRequired);
   });
 
+  it("accepts a locally selected ~/.ssh key without pasting its content", () => {
+    const form = tunnelForm({
+      authType: "private_key",
+      privateKeyInput: "",
+      privateKeyPath: "id_ed25519",
+    });
+    expect(validateTunnel(form).privateKey).toBeUndefined();
+  });
+
   it("rejects more than the jump limit", () => {
     const jumps = Array.from({ length: MAX_JUMPS + 1 }, () => jump());
     expect(validateTunnel(tunnelForm({ jumps })).jumps).toBe(
@@ -386,6 +396,36 @@ describe("toTunnelInput", () => {
       "second",
     ]);
   });
+
+  it("passes only the ~/.ssh file name, never its content", () => {
+    const input = toTunnelInput(
+      tunnelForm({
+        authType: "private_key",
+        privateKeyInput: "",
+        privateKeyPath: "  id_ed25519  ",
+        jumps: [jump({ authType: "private_key", passwordInput: "", privateKeyPath: "id_rsa" })],
+      }),
+    );
+    expect(input.credentials.privateKeyPath).toBe("id_ed25519");
+    // 仍然发 null，后端以路径为准读取文件，避免把旧内容误当成新密钥。
+    expect(input.credentials.privateKey).toBeNull();
+    expect(input.jumps[0].credentials.privateKeyPath).toBe("id_rsa");
+  });
+
+  it("does not send a stale local key path after switching to password auth", () => {
+    const input = toTunnelInput(
+      tunnelForm({ authType: "password", privateKeyPath: "id_rsa" }),
+    );
+    expect(input.credentials.privateKeyPath).toBeNull();
+  });
+
+  it("omits the local key reference when the user pasted content", () => {
+    const input = toTunnelInput(
+      tunnelForm({ authType: "private_key", privateKeyInput: "-----BEGIN KEY-----" }),
+    );
+    expect(input.credentials.privateKeyPath).toBeNull();
+    expect(input.credentials.privateKey).toBe("-----BEGIN KEY-----");
+  });
 });
 
 describe("toAppInput", () => {
@@ -423,6 +463,12 @@ describe("form hydration", () => {
     expect(restored.passwordInput).toBe("");
     expect(restored.passwordCleared).toBe(false);
     expect(hasSavedPassword(restored)).toBe(true);
+  });
+
+  it("starts with no ~/.ssh key selected", () => {
+    expect(tunnelFormFrom(undefined).privateKeyPath).toBeNull();
+    expect(jumpFormFrom(undefined).privateKeyPath).toBeNull();
+    expect(usesLocalKey(tunnelFormFrom(undefined))).toBe(false);
   });
 
   it("round-trips an existing tunnel into the form", () => {

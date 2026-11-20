@@ -180,6 +180,27 @@ const paths: Record<string, ReactNode> = {
       <path d="M6 6l1 14h10l1-14" />
     </>
   ),
+  download: (
+    <>
+      <path d="M12 4v11" />
+      <path d="M7.5 10.5L12 15l4.5-4.5" />
+      <path d="M4 19h16" />
+    </>
+  ),
+  upload: (
+    <>
+      <path d="M12 15V4" />
+      <path d="M7.5 8.5L12 4l4.5 4.5" />
+      <path d="M4 19h16" />
+    </>
+  ),
+  package: (
+    <>
+      <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z" />
+      <path d="M4 7.5L12 12l8-4.5" />
+      <path d="M12 12v9" />
+    </>
+  ),
 };
 
 export function Icon({

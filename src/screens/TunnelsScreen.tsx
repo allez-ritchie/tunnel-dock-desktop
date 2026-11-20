@@ -20,6 +20,8 @@ interface Props {
   onEdit: (id: string) => void;
   onDelete: (id: string) => void;
   onCreate: () => void;
+  /** 打开「导入 ~/.ssh/config」页面。 */
+  onImportSshConfig: () => void;
 }
 
 export function TunnelsScreen({
@@ -31,6 +33,7 @@ export function TunnelsScreen({
   onEdit,
   onDelete,
   onCreate,
+  onImportSshConfig,
 }: Props) {
   const [deleteConfirm, setDeleteConfirm] = useState<TunnelView | null>(null);
 
@@ -64,6 +67,14 @@ export function TunnelsScreen({
           </div>
         </div>
         <div className="page-header-actions">
+          <button
+            type="button"
+            className="btn outline sm"
+            onClick={onImportSshConfig}
+          >
+            <Icon name="terminal" size={16} />
+            {strings.sshConfigEntry}
+          </button>
           <button type="button" className="btn primary sm" onClick={onCreate}>
             <Icon name="plus" size={16} />
             {strings.tunnelsAdd}

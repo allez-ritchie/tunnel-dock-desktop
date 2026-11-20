@@ -2251,3 +2251,146 @@ button:focus-visible {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ------------------------------------------------- 本机私钥 / 配置包导入导出 */
+
+.local-key-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.local-key-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.bundle-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.bundle-name-list {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.config-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.config-summary > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 11px 13px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.config-summary strong {
+  font-size: 18px;
+  font-family: var(--font-mono);
+}
+
+.config-summary span {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.config-toolbar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.config-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.config-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.config-row.is-disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+}
+
+.config-row input[type="checkbox"] {
+  margin-top: 3px;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary-strong);
+}
+
+.config-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.config-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.config-row-head strong {
+  font-size: 13.5px;
+}
+
+.config-row-head span {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.config-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.config-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--chip-bg);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.config-badge.is-muted {
+  opacity: 0.75;
+}
+
+.config-badge.is-warn {
+  color: var(--connecting);
+  border-color: color-mix(in srgb, var(--connecting) 40%, var(--border-strong));
+}

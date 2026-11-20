@@ -115,6 +115,11 @@ export interface CredentialInput {
   password: string | null;
   privateKey: string | null;
   passphrase: string | null;
+  /**
+   * `~/.ssh` 下的文件名。设置后由后端读取该文件作为私钥，
+   * 前端不再接触密钥内容；与 `privateKey` 同时出现时以本字段为准。
+   */
+  privateKeyPath?: string | null;
 }
 
 export interface JumpInput {
@@ -157,6 +162,72 @@ export interface GroupInput {
   name: string;
 }
 
+/** `~/.ssh` 下的一个私钥文件。 */
+export interface LocalSshKey {
+  name: string;
+  path: string;
+  /** `ssh-rsa` / `ssh-ed25519` 等；无法判断时为空串。 */
+  keyType: string;
+  encrypted: boolean;
+}
+
+export interface LocalSshStatus {
+  available: boolean;
+  root: string;
+  keys: LocalSshKey[];
+  configAvailable: boolean;
+  configPath: string;
+  configHostCount: number;
+  configImportableCount: number;
+}
+
+/** `~/.ssh/config` 里的一条 Host。 */
+export interface SshConfigHost {
+  alias: string;
+  hostName: string;
+  user: string;
+  port: number;
+  identityFile: string | null;
+  proxyJump: string[];
+  importable: boolean;
+  /** `proxy_command` / `include` / `match` / `proxy_jump`。 */
+  unsupported: string | null;
+}
+
+export interface ExportSummary {
+  path: string;
+  tunnels: number;
+  groups: number;
+  apps: number;
+  /** 使用密码认证、因此没有导出密码的隧道。 */
+  passwordTunnels: string[];
+  /** 使用密码认证、因此没有导出凭据的跳板机。 */
+  passwordJumps: string[];
+}
+
+export interface BundlePreview {
+  tunnelCount: number;
+  groupCount: number;
+  appCount: number;
+  tunnelNames: string[];
+  groupNames: string[];
+  exportedAt: number;
+  /** 清单里缺少私钥的隧道数量：导入后需要手动补凭据。 */
+  tunnelsWithoutKey: number;
+}
+
+export interface ImportSummary {
+  tunnelsAdded: number;
+  tunnelsReused: number;
+  groupsAdded: number;
+  groupsReused: number;
+  appsAdded: number;
+  appsSkipped: number;
+  /** 与现有应用撞了本地端口，导入后需要改端口才能启动。 */
+  portConflicts: string[];
+  appsDropped: number;
+}
+
 export const api = {
   loadDock: () => invoke<DockView>("load_dock"),
   saveTunnel: (input: TunnelInput) => invoke<TunnelView>("save_tunnel", { input }),
@@ -171,6 +242,15 @@ export const api = {
   stopGroup: (groupId: string) => invoke<void>("stop_group", { groupId }),
   saveGroup: (input: GroupInput) => invoke<GroupView>("save_group", { input }),
   deleteGroup: (id: string) => invoke<void>("delete_group", { id }),
+  localSshStatus: () => invoke<LocalSshStatus>("local_ssh_status"),
+  localSshConfigHosts: () =>
+    invoke<SshConfigHost[]>("local_ssh_config_hosts"),
+  /** 把选中的 `~/.ssh/config` 别名导入为隧道；已存在的别名会被跳过。 */
+  importLocalSshConfig: (aliases: string[]) =>
+    invoke<TunnelView[]>("import_local_ssh_config", { aliases }),
+  exportBundle: (path: string) => invoke<ExportSummary>("export_bundle", { path }),
+  previewBundle: (path: string) => invoke<BundlePreview>("preview_bundle", { path }),
+  importBundle: (path: string) => invoke<ImportSummary>("import_bundle", { path }),
   knownHostsCount: () => invoke<number>("known_hosts_count"),
   clearKnownHosts: () => invoke<void>("clear_known_hosts"),
   openUrl: (url: string) => invoke<void>("open_url", { url }),

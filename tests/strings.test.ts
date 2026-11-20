@@ -75,4 +75,26 @@ describe("strings", () => {
     expect(strings.tunnelDeleteBody("家庭 NAS", 1)).toContain("家庭 NAS");
     expect(strings.toastTunnelDeleted(2)).toContain("2");
   });
+
+  it("summarizes bundle counts and skips without placeholders", () => {
+    expect(strings.settingsBundleCounts(3, 5, 2)).toBe(
+      "将导出 2 个应用组、5 个应用、3 条隧道",
+    );
+    expect(strings.bundleImported(1, 2, 3)).toContain("1");
+    expect(strings.bundleImportedSkipped(2, 1)).toContain("2");
+    expect(strings.bundleImportedConflicts("后台（18080）")).toContain("18080");
+    expect(strings.settingsBundleExportSkipped("NAS、DB")).toContain("NAS");
+    expect(strings.bundlePreviewBody(1, 2, 3)).toContain("3");
+    expect(strings.bundlePreviewMissingKeys(2)).toContain("2");
+    expect(strings.bundleImportedNoKey(3)).toContain("3");
+  });
+
+  it("describes ~/.ssh config import states", () => {
+    expect(strings.sshConfigFound(3, 3)).toBe("共 3 个主机，全部可直接导入");
+    expect(strings.sshConfigFound(4, 2)).toBe("共 4 个主机，其中 2 个可直接导入");
+    expect(strings.sshConfigImported(2)).toContain("2");
+    expect(strings.sshConfigSelected(0)).toContain("0");
+    expect(strings.localKeySelected("id_ed25519")).toContain("id_ed25519");
+    expect(strings.sshConfigUnsupported("ProxyCommand")).toContain("ProxyCommand");
+  });
 });

@@ -14,6 +14,7 @@ import { AppsScreen } from "./screens/AppsScreen";
 import { AppEditorScreen } from "./screens/AppEditorScreen";
 import { ErrorDetailScreen } from "./screens/ErrorDetailScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
+import { SshConfigImportScreen } from "./screens/SshConfigImportScreen";
 import { TunnelsScreen, type TestEntry } from "./screens/TunnelsScreen";
 import { TunnelEditorScreen } from "./screens/TunnelEditorScreen";
 import { nextPort } from "./draft";
@@ -27,6 +28,7 @@ type OverlaySpec =
       defaults: { groupId: string; tunnelId: string; localPort: number };
     }
   | { kind: "tunnel-editor"; tunnelId: string | null }
+  | { kind: "ssh-config-import" }
   | { kind: "error-detail"; appId: string };
 
 type Overlay = OverlaySpec & { key: string };
@@ -224,6 +226,10 @@ export default function App() {
     push({ kind: "error-detail", appId: id });
   }
 
+  function openSshConfigImport() {
+    push({ kind: "ssh-config-import" });
+  }
+
   /** Runs an action, reporting failures as a toast. Never throws. */
   async function run(action: () => Promise<unknown>): Promise<boolean> {
     try {
@@ -307,6 +313,14 @@ export default function App() {
     if (deleted) notify(strings.toastGroupDeleted);
   }
 
+  /** 导入 `~/.ssh/config` 中选中的主机，返回实际新建的隧道数量。 */
+  async function importSshConfigHosts(aliases: string[]): Promise<number> {
+    const created = await api.importLocalSshConfig(aliases);
+    await refreshDock();
+    if (created.length > 0) notify(strings.sshConfigImported(created.length));
+    return created.length;
+  }
+
   async function testTunnel(id: string) {
     setTests((current) => ({ ...current, [id]: "testing" }));
     try {
@@ -377,6 +391,15 @@ export default function App() {
         />
       );
     }
+    if (overlay.kind === "ssh-config-import") {
+      return (
+        <SshConfigImportScreen
+          existingNames={dock.tunnels.map((tunnel) => tunnel.name)}
+          onClose={pop}
+          onImport={importSshConfigHosts}
+        />
+      );
+    }
     const app = appMap.get(overlay.appId);
     const status =
       app !== undefined
@@ -437,6 +460,7 @@ export default function App() {
             onEdit={openEditTunnel}
             onDelete={(id) => void run(() => deleteTunnel(id))}
             onCreate={openCreateTunnel}
+            onImportSshConfig={openSshConfigImport}
           />
         ) : null}
 
@@ -455,6 +479,10 @@ export default function App() {
               await refreshKnownHosts();
             }}
             onMessage={notify}
+            onImported={async () => {
+              await refreshDock();
+              await refreshKnownHosts();
+            }}
           />
         ) : null}
       </div>

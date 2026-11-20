@@ -21,6 +21,8 @@ export interface JumpForm {
   passwordCleared: boolean;
   privateKeyInput: string;
   privateKeyCleared: boolean;
+  /** 选中的 `~/.ssh/<名称>`；保存时由后端读取文件，前端不接触内容。 */
+  privateKeyPath: string | null;
   passphraseInput: string;
   passphraseCleared: boolean;
   hasPassword: boolean;
@@ -39,6 +41,8 @@ export interface TunnelForm {
   passwordCleared: boolean;
   privateKeyInput: string;
   privateKeyCleared: boolean;
+  /** 选中的 `~/.ssh/<名称>`；保存时由后端读取文件，前端不接触内容。 */
+  privateKeyPath: string | null;
   passphraseInput: string;
   passphraseCleared: boolean;
   hasPassword: boolean;
@@ -85,6 +89,7 @@ export function jumpFormFrom(jump?: JumpView): JumpForm {
     passwordCleared: false,
     privateKeyInput: "",
     privateKeyCleared: false,
+    privateKeyPath: null,
     passphraseInput: "",
     passphraseCleared: false,
     hasPassword: jump?.credentials.hasPassword ?? false,
@@ -105,6 +110,7 @@ export function tunnelFormFrom(tunnel?: TunnelView): TunnelForm {
     passwordCleared: false,
     privateKeyInput: "",
     privateKeyCleared: false,
+    privateKeyPath: null,
     passphraseInput: "",
     passphraseCleared: false,
     hasPassword: tunnel?.credentials.hasPassword ?? false,
@@ -144,7 +150,12 @@ export function hasSavedPassword(form: JumpForm | TunnelForm): boolean {
 }
 
 export function hasSavedPrivateKey(form: JumpForm | TunnelForm): boolean {
-  return form.hasPrivateKey && !form.privateKeyCleared;
+  return (form.hasPrivateKey && !form.privateKeyCleared) || usesLocalKey(form);
+}
+
+/** 是否选择了 `~/.ssh` 里的私钥文件（保存在本机，不在表单里传内容）。 */
+export function usesLocalKey(form: JumpForm | TunnelForm): boolean {
+  return (form.privateKeyPath ?? "").trim() !== "";
 }
 
 export function hasSavedPassphrase(form: JumpForm | TunnelForm): boolean {
@@ -263,6 +274,31 @@ export function validateApp(
   return errors;
 }
 
+function credentialInput(form: JumpForm | TunnelForm) {
+  return {
+    authType: form.authType,
+    password: form.passwordCleared
+      ? ""
+      : form.passwordInput !== ""
+        ? form.passwordInput
+        : null,
+    privateKey: form.privateKeyCleared
+      ? ""
+      : form.privateKeyInput !== ""
+        ? form.privateKeyInput
+        : null,
+    passphrase: form.passphraseCleared
+      ? ""
+      : form.passphraseInput !== ""
+        ? form.passphraseInput
+        : null,
+    privateKeyPath:
+      form.authType === "private_key" && usesLocalKey(form)
+        ? (form.privateKeyPath ?? "").trim()
+        : null,
+  };
+}
+
 export function toJumpInput(jump: JumpForm): JumpInput {
   return {
     id: jump.id,
@@ -270,24 +306,7 @@ export function toJumpInput(jump: JumpForm): JumpInput {
     host: jump.host.trim(),
     port: Number(jump.port),
     username: jump.username.trim(),
-    credentials: {
-      authType: jump.authType,
-      password: jump.passwordCleared
-        ? ""
-        : jump.passwordInput !== ""
-          ? jump.passwordInput
-          : null,
-      privateKey: jump.privateKeyCleared
-        ? ""
-        : jump.privateKeyInput !== ""
-          ? jump.privateKeyInput
-          : null,
-      passphrase: jump.passphraseCleared
-        ? ""
-        : jump.passphraseInput !== ""
-          ? jump.passphraseInput
-          : null,
-    },
+    credentials: credentialInput(jump),
   };
 }
 
@@ -298,24 +317,7 @@ export function toTunnelInput(form: TunnelForm): TunnelInput {
     sshHost: form.sshHost.trim(),
     sshPort: Number(form.sshPort),
     sshUser: form.sshUser.trim(),
-    credentials: {
-      authType: form.authType,
-      password: form.passwordCleared
-        ? ""
-        : form.passwordInput !== ""
-          ? form.passwordInput
-          : null,
-      privateKey: form.privateKeyCleared
-        ? ""
-        : form.privateKeyInput !== ""
-          ? form.privateKeyInput
-          : null,
-      passphrase: form.passphraseCleared
-        ? ""
-        : form.passphraseInput !== ""
-          ? form.passphraseInput
-          : null,
-    },
+    credentials: credentialInput(form),
     jumps: form.jumps.map(toJumpInput),
     autoReconnect: form.autoReconnect,
     keepAliveSeconds: Number(form.keepAliveSeconds),
