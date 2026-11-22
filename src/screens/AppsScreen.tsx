@@ -12,7 +12,12 @@ import {
   WarningBox,
   phaseColor,
 } from "../components/ui";
-import { appUnavailable, resolveAppStatus } from "../status";
+import {
+  appUnavailable,
+  preferredEndpoint,
+  resolveAppStatus,
+  usedFallback,
+} from "../status";
 import { describeError, strings } from "../strings";
 
 interface Props {
@@ -393,6 +398,11 @@ interface CardItem {
   unavailable: boolean;
 }
 
+/** 首选线路的跳板级数（多线路时各条线路的跳板可能不同）。 */
+function jumpsOf(tunnel: TunnelView): number {
+  return preferredEndpoint(tunnel)?.jumps.length ?? 0;
+}
+
 function AppCard({
   item,
   onStart,
@@ -417,12 +427,14 @@ function AppCard({
   const { app, tunnel, status, unavailable } = item;
   const color = unavailable ? "var(--danger)" : phaseColor(status.phase);
   const live = ["connected", "connecting", "reconnecting"].includes(status.phase);
+  const fallback = usedFallback(status, tunnel);
   const errorText =
     unavailable || status.errorCode
       ? describeError(
           status.errorCode ?? (unavailable ? "tunnel_deleted" : null),
           status.errorDetail,
           app.localPort,
+          tunnel?.name,
         )
       : null;
 
@@ -531,9 +543,13 @@ function AppCard({
       </div>
 
       <div className="card-chips">
-        {tunnel && tunnel.jumps.length > 0 ? (
+        {tunnel && tunnel.endpoints.length > 1 ? (
+          <Chip color="var(--primary)" icon="route">
+            {strings.tunnelEndpointCount(tunnel.endpoints.length)}
+          </Chip>
+        ) : tunnel && jumpsOf(tunnel) > 0 ? (
           <Chip color="var(--secondary)" icon="route">
-            {strings.tunnelJumpCount(tunnel.jumps.length)}
+            {strings.tunnelJumpCount(jumpsOf(tunnel))}
           </Chip>
         ) : null}
         {app.autoStartOnBoot ? (
@@ -578,6 +594,23 @@ function AppCard({
           </span>
           <Icon name="chevronRight" size={16} />
         </button>
+      ) : null}
+
+      {/*
+       * 走的是哪条线路：本地端口对第三方透明，但用户自己必须看得见当前入口，
+       * 否则“为什么在家能连、公司不能”无从判断。
+       */}
+      {status.endpoint ? (
+        <p className={`card-endpoint mono${fallback ? " is-fallback" : ""}`}>
+          <Icon name="route" size={12} />
+          {strings.endpointInUse(status.endpoint.label)}
+        </p>
+      ) : null}
+      {fallback && status.endpoint ? (
+        <p className="card-fallback">
+          <Icon name="swap" size={12} />
+          {strings.endpointFallbackUsed(status.endpoint.label)}
+        </p>
       ) : null}
 
       {status.phase === "connected" ? (

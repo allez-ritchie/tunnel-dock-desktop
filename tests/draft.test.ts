@@ -1,17 +1,24 @@
 import { describe, expect, it } from "vitest";
 import type {
   AppView,
+  EndpointView,
   GroupView,
   JumpInput,
   TunnelView,
 } from "../src/api";
 import {
+  MAX_ENDPOINTS,
   MAX_JUMPS,
   appFormFrom,
   chainPreview,
+  duplicateEndpointLabel,
+  endpointChainPreview,
+  endpointError,
+  endpointFormFrom,
   hasSavedPassword,
   jumpError,
   jumpFormFrom,
+  nextEndpointLabel,
   nextPort,
   toAppInput,
   toTunnelInput,
@@ -20,20 +27,30 @@ import {
   validateApp,
   validateTunnel,
   type AppForm,
+  type EndpointForm,
   type JumpForm,
   type TunnelForm,
 } from "../src/draft";
 import { strings } from "../src/strings";
 
+function endpointForm(overrides: Partial<EndpointForm> = {}): EndpointForm {
+  return {
+    ...endpointFormFrom(undefined),
+    label: "外网",
+    host: "example.com",
+    port: "22",
+    username: "ops",
+    authType: "password",
+    passwordInput: "s3cret",
+    ...overrides,
+  };
+}
+
 function tunnelForm(overrides: Partial<TunnelForm> = {}): TunnelForm {
   return {
     ...tunnelFormFrom(undefined),
     name: "家庭 NAS",
-    sshHost: "example.com",
-    sshPort: "22",
-    sshUser: "ops",
-    authType: "password",
-    passwordInput: "s3cret",
+    endpoints: [endpointForm()],
     ...overrides,
   };
 }
@@ -51,13 +68,14 @@ function appForm(overrides: Partial<AppForm> = {}): AppForm {
   };
 }
 
-function tunnelView(overrides: Partial<TunnelView> = {}): TunnelView {
+function endpointView(overrides: Partial<EndpointView> = {}): EndpointView {
   return {
-    id: "t1",
-    name: "NAS",
-    sshHost: "example.com",
-    sshPort: 22,
-    sshUser: "ops",
+    id: "e1",
+    label: "外网",
+    displayName: "外网",
+    host: "example.com",
+    port: 22,
+    username: "ops",
     credentials: {
       authType: "password",
       hasPassword: true,
@@ -65,14 +83,30 @@ function tunnelView(overrides: Partial<TunnelView> = {}): TunnelView {
       hasPassphrase: false,
     },
     jumps: [],
+    wifiOnly: false,
+    enabled: true,
+    endpoint: "ops@example.com:22",
+    chainSummary: "example.com",
+    dialable: true,
+    ...overrides,
+  };
+}
+
+function tunnelView(overrides: Partial<TunnelView> = {}): TunnelView {
+  return {
+    id: "t1",
+    name: "NAS",
+    endpoints: [endpointView()],
     autoReconnect: true,
     keepAliveSeconds: 30,
     connectTimeoutSeconds: 15,
     strictHostKey: true,
+    preferredEndpointId: "e1",
     createdAt: 1,
     updatedAt: 1,
     endpoint: "ops@example.com:22",
     chainSummary: "example.com",
+    dialableCount: 1,
     ...overrides,
   };
 }
@@ -132,19 +166,30 @@ describe("nextPort", () => {
   });
 });
 
+describe("nextEndpointLabel", () => {
+  it("starts at 线路 1 for a tunnel with no lines", () => {
+    expect(nextEndpointLabel([])).toBe(strings.endpointDefaultLabel(1));
+  });
+
+  it("skips labels that are already taken", () => {
+    const first = strings.endpointDefaultLabel(1);
+    const second = strings.endpointDefaultLabel(2);
+    expect(nextEndpointLabel([first])).toBe(second);
+    expect(nextEndpointLabel([first, second])).toBe(
+      strings.endpointDefaultLabel(3),
+    );
+  });
+});
+
 describe("validateTunnel", () => {
   it("accepts a complete form", () => {
     expect(validateTunnel(tunnelForm())).toEqual({});
   });
 
-  it("reports the fields a brand-new form is missing", () => {
-    const errors = validateTunnel(tunnelFormFrom());
-    expect(errors.name).toBe(strings.errorNameRequired);
-    expect(errors.sshHost).toBe(strings.errorSshHostRequired);
-    expect(errors.password).toBe(strings.errorPasswordRequired);
-    // Defaults that the editor pre-fills must not raise errors on their own.
-    expect(errors.sshUser).toBeUndefined();
-    expect(errors.sshPort).toBeUndefined();
+  it("requires a name", () => {
+    expect(validateTunnel(tunnelForm({ name: " " })).name).toBe(
+      strings.errorNameRequired,
+    );
   });
 
   it("rejects names longer than 40 characters", () => {
@@ -157,21 +202,6 @@ describe("validateTunnel", () => {
     expect(
       validateTunnel(tunnelForm({ name: "名".repeat(40) })).name,
     ).toBeUndefined();
-  });
-
-  it("rejects non-numeric and out-of-range ports", () => {
-    expect(validateTunnel(tunnelForm({ sshPort: "abc" })).sshPort).toBe(
-      strings.errorSshPort,
-    );
-    expect(validateTunnel(tunnelForm({ sshPort: "0" })).sshPort).toBe(
-      strings.errorSshPort,
-    );
-  });
-
-  it("rejects hostnames containing whitespace", () => {
-    expect(validateTunnel(tunnelForm({ sshHost: "bad host" })).sshHost).toBe(
-      strings.errorSshHostRequired,
-    );
   });
 
   it("enforces keepalive and timeout bounds", () => {
@@ -192,50 +222,149 @@ describe("validateTunnel", () => {
     ).toEqual({});
   });
 
-  it("requires a secret only when none is saved", () => {
-    const withoutSaved = tunnelForm({ passwordInput: "", hasPassword: false });
-    expect(validateTunnel(withoutSaved).password).toBe(
-      strings.errorPasswordRequired,
+  it("requires at least one endpoint", () => {
+    expect(validateTunnel(tunnelForm({ endpoints: [] })).endpoints).toBe(
+      strings.errorEndpointRequired,
     );
+  });
 
-    const withSaved = tunnelForm({ passwordInput: "", hasPassword: true });
-    expect(validateTunnel(withSaved).password).toBeUndefined();
+  it("rejects a tunnel whose lines are all disabled", () => {
+    expect(
+      validateTunnel(
+        tunnelForm({ endpoints: [endpointForm({ enabled: false })] }),
+      ).endpoints,
+    ).toBe(strings.errorEndpointAllDisabled);
+  });
 
-    const cleared = tunnelForm({
-      passwordInput: "",
-      hasPassword: true,
-      passwordCleared: true,
-    });
-    expect(validateTunnel(cleared).password).toBe(strings.errorPasswordRequired);
+  it("rejects more than the endpoint limit", () => {
+    const endpoints = Array.from({ length: MAX_ENDPOINTS + 1 }, (_, index) =>
+      endpointForm({ label: `线路 ${index + 1}` }),
+    );
+    expect(validateTunnel(tunnelForm({ endpoints })).endpoints).toBe(
+      strings.errorMaxEndpoints,
+    );
+  });
+
+  it("surfaces the first incomplete line", () => {
+    expect(
+      validateTunnel(
+        tunnelForm({
+          endpoints: [
+            endpointForm(),
+            endpointForm({ label: "内网", host: "bad host" }),
+          ],
+        }),
+      ).endpoints,
+    ).toBe(strings.errorEndpointHostRequired);
+  });
+
+  it("rejects duplicate line names", () => {
+    expect(
+      validateTunnel(
+        tunnelForm({
+          endpoints: [
+            endpointForm(),
+            endpointForm({ label: "外网", host: "other.example.com" }),
+          ],
+        }),
+      ).endpoints,
+    ).toBe(strings.errorEndpointLabelDuplicate);
+  });
+});
+
+describe("endpointError", () => {
+  it("accepts a complete line", () => {
+    expect(endpointError(endpointForm())).toBeNull();
+  });
+
+  it("validates host, port and username", () => {
+    expect(endpointError(endpointForm({ host: " " }))).toBe(
+      strings.errorEndpointHostRequired,
+    );
+    expect(endpointError(endpointForm({ host: "bad host" }))).toBe(
+      strings.errorEndpointHostRequired,
+    );
+    expect(endpointError(endpointForm({ port: "0" }))).toBe(
+      strings.errorEndpointPort,
+    );
+    expect(endpointError(endpointForm({ port: "abc" }))).toBe(
+      strings.errorEndpointPort,
+    );
+    expect(endpointError(endpointForm({ username: "" }))).toBe(
+      strings.errorEndpointUsernameRequired,
+    );
+  });
+
+  it("bounds the line label", () => {
+    expect(endpointError(endpointForm({ label: "名".repeat(41) }))).toBe(
+      strings.errorEndpointLabelTooLong,
+    );
+  });
+
+  it("requires a secret only when none is saved", () => {
+    expect(
+      endpointError(endpointForm({ passwordInput: "", hasPassword: false })),
+    ).toBe(strings.errorEndpointPasswordRequired);
+    expect(
+      endpointError(endpointForm({ passwordInput: "", hasPassword: true })),
+    ).toBeNull();
+    expect(
+      endpointError(
+        endpointForm({
+          passwordInput: "",
+          hasPassword: true,
+          passwordCleared: true,
+        }),
+      ),
+    ).toBe(strings.errorEndpointPasswordRequired);
   });
 
   it("requires a private key when key auth is selected", () => {
-    const errors = validateTunnel(
-      tunnelForm({ authType: "private_key", privateKeyInput: "" }),
-    );
-    expect(errors.privateKey).toBe(strings.errorPrivateKeyRequired);
+    expect(
+      endpointError(endpointForm({ authType: "private_key", privateKeyInput: "" })),
+    ).toBe(strings.errorEndpointPrivateKeyRequired);
   });
 
   it("accepts a locally selected ~/.ssh key without pasting its content", () => {
-    const form = tunnelForm({
-      authType: "private_key",
-      privateKeyInput: "",
-      privateKeyPath: "id_ed25519",
-    });
-    expect(validateTunnel(form).privateKey).toBeUndefined();
+    expect(
+      endpointError(
+        endpointForm({
+          authType: "private_key",
+          privateKeyInput: "",
+          privateKeyPath: "id_ed25519",
+        }),
+      ),
+    ).toBeNull();
   });
 
   it("rejects more than the jump limit", () => {
     const jumps = Array.from({ length: MAX_JUMPS + 1 }, () => jump());
-    expect(validateTunnel(tunnelForm({ jumps })).jumps).toBe(
-      strings.errorMaxJumps,
-    );
+    expect(endpointError(endpointForm({ jumps }))).toBe(strings.errorMaxJumps);
   });
 
-  it("rejects an incomplete jump inside the list", () => {
-    expect(
-      validateTunnel(tunnelForm({ jumps: [jump({ host: "" })] })).jumps,
-    ).toBe(strings.errorJumpInvalid);
+  it("rejects an incomplete jump inside the line", () => {
+    expect(endpointError(endpointForm({ jumps: [jump({ host: "" })] }))).toBe(
+      strings.errorJumpInvalid,
+    );
+  });
+});
+
+describe("duplicateEndpointLabel", () => {
+  it("ignores unnamed lines and itself", () => {
+    const endpoints = [
+      endpointForm({ label: "" }),
+      endpointForm({ label: "", host: "b.example.com" }),
+    ];
+    expect(duplicateEndpointLabel(endpoints, 0)).toBe(false);
+    expect(duplicateEndpointLabel(endpoints, 1)).toBe(false);
+  });
+
+  it("detects a repeated name", () => {
+    const endpoints = [
+      endpointForm({ label: "外网" }),
+      endpointForm({ label: "外网", host: "b.example.com" }),
+    ];
+    expect(duplicateEndpointLabel(endpoints, 0)).toBe(true);
   });
 });
 
@@ -331,67 +460,121 @@ describe("jumpError", () => {
 describe("toTunnelInput", () => {
   it("sends null for untouched secrets so the backend keeps them", () => {
     const input = toTunnelInput(
-      tunnelForm({ id: "t1", hasPassword: true, passwordInput: "" }),
+      tunnelForm({
+        id: "t1",
+        endpoints: [endpointForm({ id: "e1", hasPassword: true, passwordInput: "" })],
+      }),
     );
-    expect(input.credentials.password).toBeNull();
-    expect(input.credentials.privateKey).toBeNull();
-    expect(input.credentials.passphrase).toBeNull();
+    expect(input.endpoints[0].credentials.password).toBeNull();
+    expect(input.endpoints[0].credentials.privateKey).toBeNull();
+    expect(input.endpoints[0].credentials.passphrase).toBeNull();
   });
 
   it("sends an empty string when the user cleared a stored secret", () => {
     const input = toTunnelInput(
-      tunnelForm({ id: "t1", hasPassword: true, passwordCleared: true }),
-    );
-    expect(input.credentials.password).toBe("");
-  });
-
-  it("sends the new secret when the user typed one", () => {
-    expect(toTunnelInput(tunnelForm({ passwordInput: "new-secret" })).credentials.password).toBe(
-      "new-secret",
-    );
-  });
-
-  it("parallelizes jump credentials", () => {
-    const input = toTunnelInput(
       tunnelForm({
-        jumps: [
-          jump({ passwordInput: "", hasPassword: true }),
-          jump({ passwordInput: "typed" }),
+        id: "t1",
+        endpoints: [
+          endpointForm({ id: "e1", hasPassword: true, passwordCleared: true }),
         ],
       }),
     );
-    expect(input.jumps[0].credentials.password).toBeNull();
-    expect(input.jumps[1].credentials.password).toBe("typed");
+    expect(input.endpoints[0].credentials.password).toBe("");
+  });
+
+  it("sends the new secret when the user typed one", () => {
+    expect(
+      toTunnelInput(tunnelForm({ endpoints: [endpointForm({ passwordInput: "new-secret" })] }))
+        .endpoints[0].credentials.password,
+    ).toBe("new-secret");
+  });
+
+  it("keeps every line, its order and its switches", () => {
+    const input = toTunnelInput(
+      tunnelForm({
+        endpoints: [
+          endpointForm({
+            id: "home",
+            label: "家庭局域网",
+            host: "192.168.1.10",
+            wifiOnly: true,
+          }),
+          endpointForm({ id: "away", label: "frp 外网", host: "frp.example.com" }),
+        ],
+        preferredEndpointId: "away",
+      }),
+    );
+    expect(input.endpoints).toHaveLength(2);
+    expect(input.endpoints[0].label).toBe("家庭局域网");
+    expect(input.endpoints[0].wifiOnly).toBe(true);
+    expect(input.endpoints[1].label).toBe("frp 外网");
+    expect(input.preferredEndpointId).toBe("away");
+  });
+
+  it("drops a preferred line that no longer exists", () => {
+    const input = toTunnelInput(
+      tunnelForm({
+        endpoints: [endpointForm({ id: "home" })],
+        preferredEndpointId: "deleted",
+      }),
+    );
+    expect(input.preferredEndpointId).toBeNull();
+  });
+
+  it("parallelizes jump credentials per line", () => {
+    const input = toTunnelInput(
+      tunnelForm({
+        endpoints: [
+          endpointForm({
+            jumps: [
+              jump({ passwordInput: "", hasPassword: true }),
+              jump({ passwordInput: "typed" }),
+            ],
+          }),
+        ],
+      }),
+    );
+    expect(input.endpoints[0].jumps[0].credentials.password).toBeNull();
+    expect(input.endpoints[0].jumps[1].credentials.password).toBe("typed");
   });
 
   it("trims text fields", () => {
     const input = toTunnelInput(
       tunnelForm({
         name: "  NAS  ",
-        sshHost: " example.com ",
-        sshUser: " ops ",
+        endpoints: [
+          endpointForm({ label: " 外网 ", host: " example.com ", username: " ops " }),
+        ],
       }),
     );
     expect(input.name).toBe("NAS");
-    expect(input.sshHost).toBe("example.com");
-    expect(input.sshUser).toBe("ops");
+    expect(input.endpoints[0].label).toBe("外网");
+    expect(input.endpoints[0].host).toBe("example.com");
+    expect(input.endpoints[0].username).toBe("ops");
   });
 
   it("converts numeric strings to numbers", () => {
     const input = toTunnelInput(
-      tunnelForm({ sshPort: "2222", keepAliveSeconds: "45" }),
+      tunnelForm({
+        endpoints: [endpointForm({ port: "2222" })],
+        keepAliveSeconds: "45",
+      }),
     );
-    expect(input.sshPort).toBe(2222);
+    expect(input.endpoints[0].port).toBe(2222);
     expect(input.keepAliveSeconds).toBe(45);
   });
 
   it("keeps the jump order stable when serializing", () => {
     const input = toTunnelInput(
       tunnelForm({
-        jumps: [jump({ label: "first" }), jump({ label: "second" })],
+        endpoints: [
+          endpointForm({
+            jumps: [jump({ label: "first" }), jump({ label: "second" })],
+          }),
+        ],
       }),
     );
-    expect(input.jumps.map((item: JumpInput) => item.label)).toEqual([
+    expect(input.endpoints[0].jumps.map((item: JumpInput) => item.label)).toEqual([
       "first",
       "second",
     ]);
@@ -400,31 +583,50 @@ describe("toTunnelInput", () => {
   it("passes only the ~/.ssh file name, never its content", () => {
     const input = toTunnelInput(
       tunnelForm({
-        authType: "private_key",
-        privateKeyInput: "",
-        privateKeyPath: "  id_ed25519  ",
-        jumps: [jump({ authType: "private_key", passwordInput: "", privateKeyPath: "id_rsa" })],
+        endpoints: [
+          endpointForm({
+            authType: "private_key",
+            privateKeyInput: "",
+            privateKeyPath: "  id_ed25519  ",
+            jumps: [
+              jump({
+                authType: "private_key",
+                passwordInput: "",
+                privateKeyPath: "id_rsa",
+              }),
+            ],
+          }),
+        ],
       }),
     );
-    expect(input.credentials.privateKeyPath).toBe("id_ed25519");
+    expect(input.endpoints[0].credentials.privateKeyPath).toBe("id_ed25519");
     // 仍然发 null，后端以路径为准读取文件，避免把旧内容误当成新密钥。
-    expect(input.credentials.privateKey).toBeNull();
-    expect(input.jumps[0].credentials.privateKeyPath).toBe("id_rsa");
+    expect(input.endpoints[0].credentials.privateKey).toBeNull();
+    expect(input.endpoints[0].jumps[0].credentials.privateKeyPath).toBe("id_rsa");
   });
 
   it("does not send a stale local key path after switching to password auth", () => {
     const input = toTunnelInput(
-      tunnelForm({ authType: "password", privateKeyPath: "id_rsa" }),
+      tunnelForm({
+        endpoints: [endpointForm({ authType: "password", privateKeyPath: "id_rsa" })],
+      }),
     );
-    expect(input.credentials.privateKeyPath).toBeNull();
+    expect(input.endpoints[0].credentials.privateKeyPath).toBeNull();
   });
 
   it("omits the local key reference when the user pasted content", () => {
     const input = toTunnelInput(
-      tunnelForm({ authType: "private_key", privateKeyInput: "-----BEGIN KEY-----" }),
+      tunnelForm({
+        endpoints: [
+          endpointForm({
+            authType: "private_key",
+            privateKeyInput: "-----BEGIN KEY-----",
+          }),
+        ],
+      }),
     );
-    expect(input.credentials.privateKeyPath).toBeNull();
-    expect(input.credentials.privateKey).toBe("-----BEGIN KEY-----");
+    expect(input.endpoints[0].credentials.privateKeyPath).toBeNull();
+    expect(input.endpoints[0].credentials.privateKey).toBe("-----BEGIN KEY-----");
   });
 });
 
@@ -459,44 +661,65 @@ describe("toAppInput", () => {
 describe("form hydration", () => {
   it("never exposes stored tunnel secrets into the form", () => {
     const restored = tunnelFormFrom(tunnelView());
-    expect(restored.hasPassword).toBe(true);
-    expect(restored.passwordInput).toBe("");
-    expect(restored.passwordCleared).toBe(false);
-    expect(hasSavedPassword(restored)).toBe(true);
+    expect(restored.endpoints[0].hasPassword).toBe(true);
+    expect(restored.endpoints[0].passwordInput).toBe("");
+    expect(restored.endpoints[0].passwordCleared).toBe(false);
+    expect(hasSavedPassword(restored.endpoints[0])).toBe(true);
   });
 
   it("starts with no ~/.ssh key selected", () => {
-    expect(tunnelFormFrom(undefined).privateKeyPath).toBeNull();
+    expect(tunnelFormFrom(undefined).endpoints).toEqual([]);
+    expect(endpointFormFrom(undefined).privateKeyPath).toBeNull();
     expect(jumpFormFrom(undefined).privateKeyPath).toBeNull();
-    expect(usesLocalKey(tunnelFormFrom(undefined))).toBe(false);
+    expect(usesLocalKey(endpointFormFrom(undefined))).toBe(false);
   });
 
-  it("round-trips an existing tunnel into the form", () => {
+  it("round-trips multi-line tunnels including switches and preference", () => {
     const source = tunnelView({
-      jumps: [
-        {
-          id: "jump-1",
-          label: "堡垒机",
-          host: "bastion",
+      endpoints: [
+        endpointView({
+          id: "home",
+          label: "家庭局域网",
+          host: "192.168.1.10",
+          wifiOnly: true,
+        }),
+        endpointView({
+          id: "away",
+          label: "frp 外网",
+          host: "frp.example.com",
           port: 2222,
-          username: "ops",
-          credentials: {
-            authType: "private_key",
-            hasPassword: false,
-            hasPrivateKey: true,
-            hasPassphrase: true,
-          },
-          inheritedFrom: null,
-        },
+          enabled: false,
+          jumps: [
+            {
+              id: "jump-1",
+              label: "堡垒机",
+              host: "bastion",
+              port: 2222,
+              username: "ops",
+              credentials: {
+                authType: "private_key",
+                hasPassword: false,
+                hasPrivateKey: true,
+                hasPassphrase: true,
+              },
+              inheritedFrom: null,
+            },
+          ],
+        }),
       ],
+      preferredEndpointId: "away",
     });
     const restored = tunnelFormFrom(source);
-    expect(restored.jumps).toHaveLength(1);
-    expect(restored.jumps[0].host).toBe("bastion");
-    expect(restored.jumps[0].authType).toBe("private_key");
-    expect(restored.jumps[0].hasPrivateKey).toBe(true);
-    expect(restored.jumps[0].hasPassphrase).toBe(true);
-    expect(restored.jumps[0].privateKeyInput).toBe("");
+    expect(restored.endpoints).toHaveLength(2);
+    expect(restored.preferredEndpointId).toBe("away");
+    expect(restored.endpoints[0].wifiOnly).toBe(true);
+    expect(restored.endpoints[1].enabled).toBe(false);
+    expect(restored.endpoints[1].port).toBe("2222");
+    expect(restored.endpoints[1].jumps).toHaveLength(1);
+    expect(restored.endpoints[1].jumps[0].authType).toBe("private_key");
+    expect(restored.endpoints[1].jumps[0].hasPrivateKey).toBe(true);
+    expect(restored.endpoints[1].jumps[0].hasPassphrase).toBe(true);
+    expect(restored.endpoints[1].jumps[0].privateKeyInput).toBe("");
   });
 
   it("uses editor defaults for a new application", () => {
@@ -523,20 +746,57 @@ describe("form hydration", () => {
 });
 
 describe("chainPreview", () => {
-  it("falls back to the SSH server label when empty", () => {
-    expect(chainPreview(tunnelFormFrom(undefined))).toBe("SSH 服务器");
+  it("falls back to the placeholder when there is no line", () => {
+    expect(chainPreview(tunnelFormFrom(undefined))).toBe(strings.editorNoEndpoint);
   });
 
   it("lists jumps in order before the target", () => {
     const preview = chainPreview(
       tunnelForm({
-        sshHost: "server",
-        jumps: [
-          jump({ label: "A", host: "a" }),
-          jump({ label: "", host: "b" }),
+        endpoints: [
+          endpointForm({
+            host: "server",
+            jumps: [jump({ label: "A", host: "a" }), jump({ label: "", host: "b" })],
+          }),
         ],
       }),
     );
     expect(preview).toBe("A  →  b  →  server");
+  });
+
+  it("describes the preferred line, not just the first one", () => {
+    const preview = chainPreview(
+      tunnelForm({
+        endpoints: [
+          endpointForm({ id: "home", host: "192.168.1.10" }),
+          endpointForm({ id: "away", host: "frp.example.com" }),
+        ],
+        preferredEndpointId: "away",
+      }),
+    );
+    expect(preview).toContain("frp.example.com");
+    expect(preview).toContain(strings.endpointCountSuffix(2));
+  });
+
+  it("appends the line count only when there are several", () => {
+    expect(
+      chainPreview(tunnelForm({ endpoints: [endpointForm({ host: "a" })] })),
+    ).toBe("a");
+  });
+});
+
+describe("endpointChainPreview", () => {
+  it("shows the placeholder for an empty address", () => {
+    expect(endpointChainPreview(endpointForm({ host: "", jumps: [] }))).toBe(
+      strings.editorServerPlaceholder,
+    );
+  });
+
+  it("joins jumps with the target", () => {
+    expect(
+      endpointChainPreview(
+        endpointForm({ host: "target", jumps: [jump({ label: "", host: "b1" })] }),
+      ),
+    ).toBe("b1  →  target");
   });
 });

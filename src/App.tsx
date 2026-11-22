@@ -336,6 +336,8 @@ export default function App() {
           errorCode: "generic",
           errorDetail: errorMessage(error),
           securityAlert: false,
+          endpointLabel: null,
+          endpointFailures: [],
         },
       }));
     }

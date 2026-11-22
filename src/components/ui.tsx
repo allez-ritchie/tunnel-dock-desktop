@@ -215,6 +215,17 @@ const paths: Record<string, ReactNode> = {
       <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
     </>
   ),
+  star: (
+    <path d="M12 3.6l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z" />
+  ),
+  wifi: (
+    <>
+      <path d="M2.5 8.5a15 15 0 0 1 19 0" />
+      <path d="M5.5 12a11 11 0 0 1 13 0" />
+      <path d="M8.5 15.5a6.5 6.5 0 0 1 7 0" />
+      <circle cx="12" cy="19" r="1" fill="currentColor" stroke="none" />
+    </>
+  ),
 };
 
 export function Icon({

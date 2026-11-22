@@ -9,6 +9,7 @@ import {
   type AppForm,
   type FormErrors,
 } from "../draft";
+import { tunnelHasDialableEndpoint } from "../status";
 import { strings } from "../strings";
 
 interface Props {
@@ -188,6 +189,9 @@ export function AppEditorScreen({
                 {tunnels.map((tunnel) => (
                   <option key={tunnel.id} value={tunnel.id}>
                     {tunnel.name} — {tunnel.endpoint}
+                    {tunnel.endpoints.length > 1
+                      ? `（${strings.tunnelEndpointCount(tunnel.endpoints.length)}）`
+                      : ""}
                   </option>
                 ))}
               </select>
@@ -196,6 +200,12 @@ export function AppEditorScreen({
               ) : tunnelMissing ? (
                 <span className="field-error">
                   {strings.appEditorTunnelMissing}
+                </span>
+              ) : selectedTunnel && !tunnelHasDialableEndpoint(selectedTunnel) ? (
+                // 隧道存在但一条线路都拨不出去：与其让用户点“启动”后才发现，
+                // 不如在选择隧道时就提示。
+                <span className="field-error">
+                  {strings.endpointNoneDialable}
                 </span>
               ) : (
                 <span className="field-hint">{strings.appEditorTunnelHint}</span>

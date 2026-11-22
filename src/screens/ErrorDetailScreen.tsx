@@ -55,6 +55,7 @@ export function ErrorDetailScreen({
     status.errorCode,
     status.errorDetail,
     app.localPort,
+    tunnel?.name,
   );
   const occurredAt = status.updatedAt
     ? new Date(status.updatedAt).toLocaleString()
@@ -115,6 +116,14 @@ export function ErrorDetailScreen({
             value={tunnel ? tunnel.name : strings.errorDetailTunnelMissing}
             wide
           />
+          {status.endpoint ? (
+            <Fact
+              label={strings.endpointSection}
+              value={`${status.endpoint.label} · ${status.endpoint.endpoint}`}
+              mono
+              wide
+            />
+          ) : null}
           {tunnel ? (
             <Fact
               label={strings.tunnelCardEndpoint}
@@ -138,6 +147,28 @@ export function ErrorDetailScreen({
             wide
           />
         </section>
+
+        {/* 多入口时逐条说明每条线路的结果，“哪条路不通”才是排障的关键。 */}
+        {status.endpointFailures.length > 0 ? (
+          <section className="error-technical">
+            <h3>{strings.endpointFailuresTitle}</h3>
+            <ul className="error-failure-list">
+              {status.endpointFailures.map((failure) => (
+                <li key={failure.endpointId}>
+                  <strong>{failure.label}</strong>
+                  <span>
+                    {describeError(
+                      failure.code,
+                      failure.detail,
+                      app.localPort,
+                      tunnel?.name,
+                    )}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
 
         <section className="error-technical">
           <h3>{strings.errorDetailTechnical}</h3>

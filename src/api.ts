@@ -40,23 +40,51 @@ export interface JumpView {
   inheritedFrom: string | null;
 }
 
-/** Reusable SSH access definition. Holds no local port and no remote target. */
+/** One SSH line: how to reach the same SSH server. */
+export interface EndpointView {
+  id: string;
+  label: string;
+  /** 线路名，没有名字时回落到主机地址。 */
+  displayName: string;
+  host: string;
+  port: number;
+  username: string;
+  credentials: CredentialState;
+  jumps: JumpView[];
+  /** 只在连上局域网（家里的服务器）时才尝试这条线路。 */
+  wifiOnly: boolean;
+  enabled: boolean;
+  /** `user@host:port`，列表里直接展示。 */
+  endpoint: string;
+  chainSummary: string;
+  /** 启用 + 地址/用户/端口/凭据齐全。 */
+  dialable: boolean;
+}
+
+/**
+ * Reusable SSH access definition. Holds no local port and no remote target.
+ *
+ * A tunnel carries an ordered list of endpoints so the same application keeps
+ * its local port while the *path* to the server depends on the situation
+ * (home LAN vs. an frp reverse proxy, for example).
+ */
 export interface TunnelView {
   id: string;
   name: string;
-  sshHost: string;
-  sshPort: number;
-  sshUser: string;
-  credentials: CredentialState;
-  jumps: JumpView[];
+  endpoints: EndpointView[];
   autoReconnect: boolean;
   keepAliveSeconds: number;
   connectTimeoutSeconds: number;
   strictHostKey: boolean;
+  /** 用户钉住的首选线路；null 表示自动（按声明顺序）。 */
+  preferredEndpointId: string | null;
   createdAt: number;
   updatedAt: number;
+  /** 首选线路（或第一条）的 `user@host:port`。 */
   endpoint: string;
   chainSummary: string;
+  /** 配置完整、当前可拨号的线路数量。 */
+  dialableCount: number;
 }
 
 /** One `localPort -> remoteHost:remotePort` forwarding rule. */
@@ -84,6 +112,22 @@ export interface GroupView {
   createdAt: number;
 }
 
+/** Why one endpoint could not be used during the most recent connect round. */
+export interface EndpointFailure {
+  endpointId: string;
+  label: string;
+  /** 语言无关的错误码，文案由界面提供。 */
+  code: string;
+  detail: string | null;
+}
+
+/** Which line is actually carrying the traffic right now. */
+export interface EndpointSelection {
+  endpointId: string;
+  label: string;
+  endpoint: string;
+}
+
 export interface AppStatus {
   appId: string;
   phase: TunnelPhase;
@@ -95,6 +139,10 @@ export interface AppStatus {
   errorCode: string | null;
   errorDetail: string | null;
   securityAlert: boolean;
+  /** 当前（或最后一次尝试）承载转发的线路。 */
+  endpoint: EndpointSelection | null;
+  /** 本轮已经失败的线路，按尝试顺序。 */
+  endpointFailures: EndpointFailure[];
   updatedAt: number;
 }
 
@@ -105,6 +153,10 @@ export interface TunnelTestResult {
   errorCode: string | null;
   errorDetail: string | null;
   securityAlert: boolean;
+  /** 测试成功的线路名。 */
+  endpointLabel: string | null;
+  /** 逐条线路的失败原因。 */
+  endpointFailures: EndpointFailure[];
 }
 
 export interface DockView {
@@ -136,18 +188,28 @@ export interface JumpInput {
   credentials: CredentialInput;
 }
 
+export interface EndpointInput {
+  id: string | null;
+  label: string;
+  host: string;
+  port: number;
+  username: string;
+  credentials: CredentialInput;
+  jumps: JumpInput[];
+  wifiOnly: boolean;
+  enabled: boolean;
+}
+
 export interface TunnelInput {
   id: string | null;
   name: string;
-  sshHost: string;
-  sshPort: number;
-  sshUser: string;
-  credentials: CredentialInput;
-  jumps: JumpInput[];
+  endpoints: EndpointInput[];
   autoReconnect: boolean;
   keepAliveSeconds: number;
   connectTimeoutSeconds: number;
   strictHostKey: boolean;
+  /** 首选线路；null 表示自动（按声明顺序）。 */
+  preferredEndpointId: string | null;
 }
 
 export interface AppInput {
