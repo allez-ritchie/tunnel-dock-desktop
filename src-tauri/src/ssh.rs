@@ -1,5 +1,7 @@
 use crate::known_hosts::{HostKeyDecision, KnownHosts};
-use crate::model::{AuthType, ForwardApp, SshCredentials, TunnelConfig, LOOPBACK};
+use crate::model::{
+    AuthType, ForwardApp, SshCredentials, TunnelConfig, TunnelEndpoint, LOOPBACK,
+};
 use crate::secrets::Secrets;
 use russh::client::{self, AuthResult, Config, Handle, Handler};
 use russh::keys::{decode_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
@@ -208,8 +210,8 @@ impl From<&ForwardApp> for ForwardSpec {
     }
 }
 
-fn hop_chain(tunnel: &TunnelConfig) -> Vec<Hop> {
-    let mut hops: Vec<Hop> = tunnel
+fn hop_chain(endpoint: &TunnelEndpoint) -> Vec<Hop> {
+    let mut hops: Vec<Hop> = endpoint
         .jumps
         .iter()
         .map(|jump| Hop {
@@ -220,10 +222,10 @@ fn hop_chain(tunnel: &TunnelConfig) -> Vec<Hop> {
         })
         .collect();
     hops.push(Hop {
-        host: tunnel.ssh_host.clone(),
-        port: tunnel.ssh_port,
-        username: tunnel.ssh_user.clone(),
-        credentials: tunnel.credentials.clone(),
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        username: endpoint.username.clone(),
+        credentials: endpoint.credentials.clone(),
     });
     hops
 }
@@ -294,6 +296,7 @@ async fn disconnect_handles(handles: &[Handle<ClientHandler>]) {
 async fn dial_chain(
     context: &ConnectContext,
     tunnel: &TunnelConfig,
+    endpoint: &TunnelEndpoint,
 ) -> Result<Vec<Handle<ClientHandler>>, TunnelError> {
     let timeout = Duration::from_secs(tunnel.connect_timeout_seconds.clamp(5, 120) as u64);
     let keepalive = Duration::from_secs(tunnel.keep_alive_seconds.clamp(5, 300) as u64);
@@ -304,7 +307,7 @@ async fn dial_chain(
         ..Config::default()
     });
 
-    let hops = hop_chain(tunnel);
+    let hops = hop_chain(endpoint);
     let mut handles: Vec<Handle<ClientHandler>> = Vec::new();
     let mut upstream: Option<Handle<ClientHandler>> = None;
 
@@ -435,22 +438,30 @@ impl Drop for SshTunnel {
     }
 }
 
-/// Authenticates through the whole jump chain without installing a local
-/// listener, then disconnects. Used by the tunnel connectivity test so a probe
-/// never touches a running application or binds a port.
-pub async fn probe(context: &ConnectContext, tunnel: &TunnelConfig) -> Result<(), TunnelError> {
-    let handles = dial_chain(context, tunnel).await?;
+/// Authenticates through the whole jump chain of one endpoint without
+/// installing a local listener, then disconnects. Used by the tunnel
+/// connectivity test so a probe never touches a running application or binds a
+/// port.
+pub async fn probe(
+    context: &ConnectContext,
+    tunnel: &TunnelConfig,
+    endpoint: &TunnelEndpoint,
+) -> Result<(), TunnelError> {
+    let handles = dial_chain(context, tunnel, endpoint).await?;
     disconnect_handles(&handles).await;
     Ok(())
 }
 
-/// Dials the tunnel and installs the application's local forward.
+/// Dials one endpoint of the tunnel and installs the application's local
+/// forward. The tunnel only contributes connection settings; the path itself
+/// comes from `endpoint`.
 pub async fn connect(
     context: &ConnectContext,
     tunnel: &TunnelConfig,
+    endpoint: &TunnelEndpoint,
     forward: &ForwardSpec,
 ) -> Result<SshTunnel, TunnelError> {
-    let handles = dial_chain(context, tunnel).await?;
+    let handles = dial_chain(context, tunnel, endpoint).await?;
 
     let listener = match TcpListener::bind((forward.local_host.as_str(), forward.local_port)).await
     {
@@ -483,6 +494,7 @@ pub async fn connect(
     tracing::info!(
         local = %format!("{}:{}", forward.local_host, local_port),
         remote = %format!("{}:{}", forward.remote_host, forward.remote_port),
+        endpoint = %format!("{} / {}", endpoint.display_name(), endpoint.chain_summary()),
         "应用转发已建立"
     );
 
@@ -627,10 +639,14 @@ mod tests {
             };
             let tunnel = TunnelConfig {
                 name: "e2e".into(),
-                ssh_host: host,
-                ssh_port: port,
-                ssh_user: user,
-                credentials,
+                endpoints: vec![TunnelEndpoint {
+                    label: "直连".into(),
+                    host,
+                    port,
+                    username: user,
+                    credentials,
+                    ..TunnelEndpoint::default()
+                }],
                 keep_alive_seconds: 5,
                 connect_timeout_seconds: 10,
                 ..TunnelConfig::default()
@@ -657,8 +673,14 @@ mod tests {
             }
         }
 
+        /// 当前（唯一的）线路。
+        fn endpoint(&self) -> TunnelEndpoint {
+            self.tunnel.endpoints[0].clone()
+        }
+
         fn host_key(&self) -> String {
-            format!("{}:{}", self.tunnel.ssh_host, self.tunnel.ssh_port)
+            let endpoint = &self.tunnel.endpoints[0];
+            format!("{}:{}", endpoint.host, endpoint.port)
         }
     }
 
@@ -688,16 +710,18 @@ mod tests {
         let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
         let mut tunnel = setup.tunnel.clone();
         if std::env::var("TD_E2E_WITH_JUMP").is_ok() {
-            tunnel.jumps = vec![JumpHost {
-                host: tunnel.ssh_host.clone(),
-                port: tunnel.ssh_port,
-                username: tunnel.ssh_user.clone(),
-                credentials: tunnel.credentials.clone(),
+            let target = setup.endpoint();
+            tunnel.endpoints[0].jumps = vec![JumpHost {
+                host: target.host.clone(),
+                port: target.port,
+                username: target.username.clone(),
+                credentials: target.credentials.clone(),
                 ..JumpHost::default()
             }];
         }
+        let endpoint = tunnel.endpoints[0].clone();
 
-        let mut tunnel = connect(&setup.context(), &tunnel, &setup.forward)
+        let mut tunnel = connect(&setup.context(), &tunnel, &endpoint, &setup.forward)
             .await
             .expect("tunnel connects");
         assert!(tunnel.local_port() > 0);
@@ -712,9 +736,55 @@ mod tests {
         let private_key =
             std::fs::read_to_string(env_required("TD_E2E_KEY", "private key")).unwrap();
         let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
-        probe(&setup.context(), &setup.tunnel)
+        probe(&setup.context(), &setup.tunnel, &setup.endpoint())
             .await
             .expect("probe authenticates");
+    }
+
+    /// 同一台服务器、两条线路：第一条指向一个不可达的端口，第二条可用。
+    /// 策略按顺序把它们排出来，逐条拨号后第二条应当成功，本地端口不变。
+    #[tokio::test]
+    #[ignore = "requires a local sshd and HTTP server"]
+    async fn e2e_falls_back_to_the_next_endpoint() {
+        let private_key =
+            std::fs::read_to_string(env_required("TD_E2E_KEY", "private key")).unwrap();
+        let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
+        let healthy = setup.endpoint();
+        let dead = TunnelEndpoint {
+            id: "dead".into(),
+            label: "坏线路".into(),
+            // 本机一个几乎不可能有服务的端口。
+            port: 2999,
+            ..healthy.clone()
+        };
+        let mut tunnel = setup.tunnel.clone();
+        tunnel.endpoints = vec![dead.clone(), healthy.clone()];
+        tunnel.preferred_endpoint_id = Some(healthy.id.clone());
+
+        let ordered = crate::endpoint_policy::order(
+            &tunnel,
+            tunnel.preferred_endpoint_id.as_deref(),
+            None,
+            true,
+        );
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].id, healthy.id, "首选线路排在最前，但仍然排除了坏线路作为候选");
+
+        // 先试坏线路：必须失败，并且是“换线路可能好”的那类错误。
+        let error = connect(&setup.context(), &tunnel, &dead, &setup.forward)
+            .await
+            .expect_err("the dead endpoint must fail");
+        assert!(
+            crate::endpoint_policy::is_endpoint_scoped(&error),
+            "连接被拒应当可以回退到下一条线路: {error:?}"
+        );
+
+        // 再试好线路：同一个本地端口规则必须仍然能建立起来。
+        let mut connection = connect(&setup.context(), &tunnel, &healthy, &setup.forward)
+            .await
+            .expect("the healthy endpoint connects");
+        assert_http_forwarded(connection.local_port()).await;
+        connection.close().await;
     }
 
     /// A pinned host key that no longer matches must abort the connection and
@@ -725,7 +795,7 @@ mod tests {
         let private_key =
             std::fs::read_to_string(env_required("TD_E2E_KEY", "private key")).unwrap();
         let setup = E2e::new(AuthType::PrivateKey, &private_key).await;
-        let mut tunnel = connect(&setup.context(), &setup.tunnel, &setup.forward)
+        let mut tunnel = connect(&setup.context(), &setup.tunnel, &setup.endpoint(), &setup.forward)
             .await
             .expect("first connect pins the key");
         tunnel.close().await;
@@ -752,7 +822,7 @@ mod tests {
             secrets: setup.secrets.clone(),
             known_hosts,
         };
-        let error = connect(&context, &setup.tunnel, &setup.forward)
+        let error = connect(&context, &setup.tunnel, &setup.endpoint(), &setup.forward)
             .await
             .expect_err("changed host key must be refused");
         assert!(
@@ -775,7 +845,7 @@ mod tests {
         let mut forward = setup.forward.clone();
         forward.local_port = port;
 
-        let error = connect(&setup.context(), &setup.tunnel, &forward)
+        let error = connect(&setup.context(), &setup.tunnel, &setup.endpoint(), &forward)
             .await
             .expect_err("bound local port must be refused");
         assert!(
@@ -793,7 +863,7 @@ mod tests {
         ))
         .unwrap();
         let setup = E2e::new(AuthType::PrivateKey, &unauthorized).await;
-        let error = connect(&setup.context(), &setup.tunnel, &setup.forward)
+        let error = connect(&setup.context(), &setup.tunnel, &setup.endpoint(), &setup.forward)
             .await
             .expect_err("unauthorized key must fail");
         assert!(
@@ -808,7 +878,7 @@ mod tests {
     async fn e2e_password_auth() {
         let password = env_required("TD_E2E_PASSWORD", "test account password");
         let setup = E2e::new(AuthType::Password, &password).await;
-        let mut tunnel = connect(&setup.context(), &setup.tunnel, &setup.forward)
+        let mut tunnel = connect(&setup.context(), &setup.tunnel, &setup.endpoint(), &setup.forward)
             .await
             .expect("password auth connects");
         assert_http_forwarded(tunnel.local_port()).await;

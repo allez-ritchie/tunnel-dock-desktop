@@ -1,8 +1,9 @@
 use crate::local_ssh::{LocalSshStatus, SshConfigHost};
 use crate::model::{
     new_id, now_millis, AppGroup, AppInput, AppStatus, AppView, AuthType, CredentialInput,
-    DockSnapshot, ForwardApp, GroupInput, GroupView, JumpHost, JumpInput, SshCredentials,
-    TunnelConfig, TunnelInput, TunnelTestResult, TunnelView, DEFAULT_GROUP_ID,
+    DockSnapshot, EndpointInput, ForwardApp, GroupInput, GroupView, JumpHost, JumpInput,
+    SshCredentials, TunnelConfig, TunnelEndpoint, TunnelInput, TunnelTestResult, TunnelView,
+    DEFAULT_GROUP_ID,
 };
 use crate::portable::{self, BundlePreview, ExportSummary, ImportSummary};
 use crate::secrets::Secrets;
@@ -10,6 +11,12 @@ use crate::AppState;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
+
+/// 一条隧道最多支持多少条线路。线路的用途是“同一台服务器的不同入口”，
+/// 再多就该拆成不同隧道了。
+const MAX_ENDPOINTS: usize = 8;
+/// 单条线路最多支持多少级跳板。
+const MAX_JUMPS: usize = 8;
 
 /// One atomic frontend snapshot: definitions plus live statuses. Keeping this in
 /// a single command avoids rendering a half-updated list during startup.
@@ -267,14 +274,24 @@ pub async fn import_local_ssh_config(
         }
         let credentials = local_ssh_credentials(host, &state)?;
         let jumps = build_config_jumps(host, &hosts, &state)?;
+        // 导入的每个 Host 别名各建一条隧道，先只放一条线路；用户之后可以
+        // 给同一条隧道补一条“外网入口”，让应用在两种网络下复用同一个本地端口。
+        let endpoint = TunnelEndpoint {
+            label: host.alias.clone(),
+            host: host.host_name.clone(),
+            port: host.port,
+            username: host.user.clone(),
+            credentials,
+            jumps,
+            wifi_only: false,
+            enabled: true,
+            ..TunnelEndpoint::default()
+        };
         let config = TunnelConfig {
             id: new_id(),
             name: host.alias.clone(),
-            ssh_host: host.host_name.clone(),
-            ssh_port: host.port,
-            ssh_user: host.user.clone(),
-            credentials,
-            jumps,
+            endpoints: vec![endpoint],
+            preferred_endpoint_id: None,
             auto_reconnect: true,
             keep_alive_seconds: crate::model::DEFAULT_KEEPALIVE_SECONDS,
             connect_timeout_seconds: crate::model::DEFAULT_CONNECT_TIMEOUT_SECONDS,
@@ -566,7 +583,7 @@ fn build_jumps(
     local_ssh: &crate::local_ssh::LocalSsh,
 ) -> Result<Vec<JumpHost>, String> {
     if input.len() > 8 {
-        return Err("最多支持 8 级跳板机".into());
+        return Err(format!("最多支持 {MAX_JUMPS} 级跳板机"));
     }
     let mut jumps = Vec::with_capacity(input.len());
     for jump in input {
@@ -607,6 +624,95 @@ fn build_jumps(
     Ok(jumps)
 }
 
+fn build_endpoints(
+    input: &[EndpointInput],
+    existing: &[TunnelEndpoint],
+    secrets: &Arc<Secrets>,
+    local_ssh: &crate::local_ssh::LocalSsh,
+) -> Result<Vec<TunnelEndpoint>, String> {
+    if input.is_empty() {
+        return Err("请至少添加一条 SSH 线路".into());
+    }
+    if input.len() > MAX_ENDPOINTS {
+        return Err(format!("最多支持 {MAX_ENDPOINTS} 条线路"));
+    }
+    if !input.iter().any(|endpoint| endpoint.enabled) {
+        return Err("请至少启用一条线路".into());
+    }
+    let mut seen_labels: HashSet<String> = HashSet::new();
+    let mut endpoints = Vec::with_capacity(input.len());
+    for endpoint in input {
+        let label = endpoint.label.trim();
+        if label.chars().count() > 40 {
+            return Err("线路名称不能超过 40 个字符".into());
+        }
+        if !label.is_empty() && !seen_labels.insert(label.to_string()) {
+            return Err(format!("线路名称“{label}”重复"));
+        }
+        if endpoint.host.trim().is_empty() || endpoint.host.contains(char::is_whitespace) {
+            return Err("请填写线路的 SSH 主机地址".into());
+        }
+        if endpoint.port == 0 {
+            return Err("SSH 端口需在 1–65535 之间".into());
+        }
+        if endpoint.username.trim().is_empty() {
+            return Err("请填写线路的 SSH 用户名".into());
+        }
+        let id = endpoint
+            .id
+            .clone()
+            .or_else(|| {
+                existing
+                    .iter()
+                    .find(|item| item.label.trim() == label && item.host.trim() == endpoint.host.trim())
+                    .map(|item| item.id.clone())
+            })
+            .unwrap_or_else(new_id);
+        let previous = existing.iter().find(|item| item.id == id);
+        let credentials = merge_credentials(
+            &previous
+                .map(|item| item.credentials.clone())
+                .unwrap_or_default(),
+            &endpoint.credentials,
+            secrets,
+            local_ssh,
+        )?;
+        match endpoint.credentials.auth_type {
+            AuthType::Password if credentials.password_cipher.is_none() => {
+                return Err(format!(
+                    "线路“{}”还没有登录密码",
+                    if label.is_empty() { &endpoint.host } else { label }
+                ));
+            }
+            AuthType::PrivateKey if credentials.private_key_cipher.is_none() => {
+                return Err(format!(
+                    "线路“{}”还没有私钥",
+                    if label.is_empty() { &endpoint.host } else { label }
+                ));
+            }
+            _ => {}
+        }
+        let jumps = build_jumps(
+            &endpoint.jumps,
+            previous.map(|item| item.jumps.as_slice()).unwrap_or(&[]),
+            secrets,
+            local_ssh,
+        )?;
+        endpoints.push(TunnelEndpoint {
+            id,
+            label: label.to_string(),
+            host: endpoint.host.trim().to_string(),
+            port: endpoint.port,
+            username: endpoint.username.trim().to_string(),
+            credentials,
+            jumps,
+            wifi_only: endpoint.wifi_only,
+            enabled: endpoint.enabled,
+        });
+    }
+    Ok(endpoints)
+}
+
 fn build_tunnel(
     input: TunnelInput,
     existing: Option<&TunnelConfig>,
@@ -620,15 +726,6 @@ fn build_tunnel(
     if name.chars().count() > 40 {
         return Err("名称不能超过 40 个字符".into());
     }
-    if input.ssh_host.trim().is_empty() || input.ssh_host.contains(char::is_whitespace) {
-        return Err("请填写 SSH 主机地址".into());
-    }
-    if input.ssh_port == 0 {
-        return Err("SSH 端口需在 1–65535 之间".into());
-    }
-    if input.ssh_user.trim().is_empty() {
-        return Err("请填写 SSH 用户名".into());
-    }
     if input.keep_alive_seconds < 5 || input.keep_alive_seconds > 300 {
         return Err("保活间隔需在 5–300 秒之间".into());
     }
@@ -641,49 +738,35 @@ fn build_tunnel(
         .clone()
         .or_else(|| existing.map(|config| config.id.clone()))
         .unwrap_or_else(new_id);
-    let previous_credentials = existing
-        .map(|config| config.credentials.clone())
-        .unwrap_or_default();
+
+    let endpoints = build_endpoints(
+        &input.endpoints,
+        existing.map(|config| config.endpoints.as_slice()).unwrap_or(&[]),
+        secrets,
+        local_ssh,
+    )?;
+
+    // 首选线路只能指向确实存在的一条线路，否则界面会拿着一个失效的 id。
+    let preferred_endpoint_id = input
+        .preferred_endpoint_id
+        .clone()
+        .filter(|wanted| endpoints.iter().any(|endpoint| &endpoint.id == wanted))
+        .or_else(|| endpoints.first().map(|endpoint| endpoint.id.clone()));
 
     let config = TunnelConfig {
         id,
         name: name.to_string(),
-        ssh_host: input.ssh_host.trim().to_string(),
-        ssh_port: input.ssh_port,
-        ssh_user: input.ssh_user.trim().to_string(),
-        credentials: merge_credentials(
-            &previous_credentials,
-            &input.credentials,
-            secrets,
-            local_ssh,
-        )?,
-        jumps: build_jumps(
-            &input.jumps,
-            existing
-                .map(|config| config.jumps.as_slice())
-                .unwrap_or(&[]),
-            secrets,
-            local_ssh,
-        )?,
+        endpoints,
         auto_reconnect: input.auto_reconnect,
         keep_alive_seconds: input.keep_alive_seconds,
         connect_timeout_seconds: input.connect_timeout_seconds,
         strict_host_key: input.strict_host_key,
+        preferred_endpoint_id,
         created_at: existing
             .map(|config| config.created_at)
             .unwrap_or_else(now_millis),
         updated_at: now_millis(),
     };
-
-    match input.credentials.auth_type {
-        AuthType::Password if config.credentials.password_cipher.is_none() => {
-            return Err("请填写登录密码".into());
-        }
-        AuthType::PrivateKey if config.credentials.private_key_cipher.is_none() => {
-            return Err("请粘贴私钥内容".into());
-        }
-        _ => {}
-    }
     Ok(config)
 }
 
@@ -757,22 +840,30 @@ mod tests {
         DEFAULT_KEEPALIVE_SECONDS,
     };
 
-    fn tunnel_input() -> TunnelInput {
-        TunnelInput {
-            id: None,
-            name: "NAS".into(),
-            ssh_host: "example.com".into(),
-            ssh_port: 22,
-            ssh_user: "ops".into(),
+    fn endpoint_input(host: &str) -> EndpointInput {
+        EndpointInput {
+            label: host.into(),
+            host: host.into(),
+            port: 22,
+            username: "ops".into(),
             credentials: CredentialInput {
                 password: Some("s3cret".into()),
                 ..CredentialInput::default()
             },
-            jumps: Vec::new(),
+            ..EndpointInput::default()
+        }
+    }
+
+    fn tunnel_input() -> TunnelInput {
+        TunnelInput {
+            id: None,
+            name: "NAS".into(),
+            endpoints: vec![endpoint_input("example.com")],
             auto_reconnect: true,
             keep_alive_seconds: DEFAULT_KEEPALIVE_SECONDS,
             connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
             strict_host_key: true,
+            preferred_endpoint_id: None,
         }
     }
 
@@ -826,8 +917,17 @@ mod tests {
         let vault = Secrets::load(dir.path()).unwrap();
         let config = build_tunnel(tunnel_input(), None, &vault, &local_ssh()).unwrap();
         assert_eq!(config.name, "NAS");
-        let cipher = config.credentials.password_cipher.unwrap();
+        let cipher = config.endpoints[0]
+            .credentials
+            .password_cipher
+            .clone()
+            .unwrap();
         assert_eq!(vault.decrypt(&cipher).unwrap(), "s3cret");
+        // 只有一条线路时，它自动成为首选，卡片才有东西可展示。
+        assert_eq!(
+            config.preferred_endpoint_id.as_deref(),
+            Some(config.endpoints[0].id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -835,9 +935,144 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
         let mut candidate = tunnel_input();
-        candidate.jumps = (0..9).map(jump).collect();
+        candidate.endpoints[0].jumps = (0..9).map(jump).collect();
         let error = build_tunnel(candidate, None, &vault, &local_ssh()).unwrap_err();
         assert!(error.contains("8 级"), "unexpected: {error}");
+    }
+
+    /// 同一个服务在不同场景走不同入口：两条线路，各自独立的地址与凭据。
+    #[tokio::test]
+    async fn a_tunnel_keeps_several_endpoints_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut input = tunnel_input();
+        input.endpoints = vec![
+            EndpointInput {
+                label: "家庭局域网".into(),
+                host: "192.168.1.10".into(),
+                wifi_only: true,
+                ..endpoint_input("192.168.1.10")
+            },
+            EndpointInput {
+                label: "frp 外网".into(),
+                host: "frp.example.com".into(),
+                port: 2222,
+                ..endpoint_input("frp.example.com")
+            },
+        ];
+        let config = build_tunnel(input, None, &vault, &local_ssh()).unwrap();
+        assert_eq!(config.endpoints.len(), 2);
+        assert_eq!(config.endpoints[0].label, "家庭局域网");
+        assert!(config.endpoints[0].wifi_only);
+        assert_eq!(config.endpoints[1].label, "frp 外网");
+        assert_eq!(config.endpoints[1].port, 2222);
+        assert_ne!(config.endpoints[0].id, config.endpoints[1].id);
+        for endpoint in &config.endpoints {
+            let cipher = endpoint.credentials.password_cipher.clone().unwrap();
+            assert_eq!(vault.decrypt(&cipher).unwrap(), "s3cret");
+        }
+        // 首选线路可以手工钉到第二条。
+        let mut pinned = tunnel_input();
+        pinned.endpoints = config
+            .endpoints
+            .iter()
+            .map(|endpoint| EndpointInput {
+                id: Some(endpoint.id.clone()),
+                label: endpoint.label.clone(),
+                host: endpoint.host.clone(),
+                port: endpoint.port,
+                username: endpoint.username.clone(),
+                credentials: CredentialInput {
+                    password: Some("s3cret".into()),
+                    ..CredentialInput::default()
+                },
+                ..EndpointInput::default()
+            })
+            .collect();
+        pinned.preferred_endpoint_id = Some(config.endpoints[1].id.clone());
+        let saved = build_tunnel(pinned, Some(&config), &vault, &local_ssh()).unwrap();
+        assert_eq!(
+            saved.preferred_endpoint_id.as_deref(),
+            Some(saved.endpoints[1].id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_needs_at_least_one_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut input = tunnel_input();
+        input.endpoints.clear();
+        let error = build_tunnel(input, None, &vault, &local_ssh()).unwrap_err();
+        assert!(error.contains("线路"), "unexpected: {error}");
+    }
+
+    #[tokio::test]
+    async fn at_least_one_endpoint_must_stay_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut input = tunnel_input();
+        input.endpoints[0].enabled = false;
+        let error = build_tunnel(input, None, &vault, &local_ssh()).unwrap_err();
+        assert!(error.contains("启用"), "unexpected: {error}");
+    }
+
+    #[tokio::test]
+    async fn endpoint_labels_must_be_unique_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+
+        let mut duplicate = tunnel_input();
+        duplicate.endpoints = vec![
+            EndpointInput {
+                label: "外网".into(),
+                ..endpoint_input("a.example.com")
+            },
+            EndpointInput {
+                label: "外网".into(),
+                ..endpoint_input("b.example.com")
+            },
+        ];
+        let error = build_tunnel(duplicate, None, &vault, &local_ssh()).unwrap_err();
+        assert!(error.contains("重复"), "unexpected: {error}");
+
+        let mut too_long = tunnel_input();
+        too_long.endpoints[0].label = "名".repeat(41);
+        let error = build_tunnel(too_long, None, &vault, &local_ssh()).unwrap_err();
+        assert!(error.contains("40"), "unexpected: {error}");
+    }
+
+    #[tokio::test]
+    async fn a_stale_preferred_endpoint_falls_back_to_the_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut input = tunnel_input();
+        input.preferred_endpoint_id = Some("gone".into());
+        let config = build_tunnel(input, None, &vault, &local_ssh()).unwrap();
+        assert_eq!(
+            config.preferred_endpoint_id.as_deref(),
+            Some(config.endpoints[0].id.as_str())
+        );
+    }
+
+    /// 编辑时线路 id 必须保住，否则跳板机的密码会随 id 变化而丢失。
+    #[tokio::test]
+    async fn editing_keeps_endpoint_ids_and_stored_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let existing = build_tunnel(tunnel_input(), None, &vault, &local_ssh()).unwrap();
+        let endpoint_id = existing.endpoints[0].id.clone();
+
+        let mut edit = tunnel_input();
+        edit.id = Some(existing.id.clone());
+        edit.endpoints[0].id = Some(endpoint_id.clone());
+        edit.endpoints[0].credentials.password = None; // null keeps the stored value
+        let updated = build_tunnel(edit, Some(&existing), &vault, &local_ssh()).unwrap();
+        assert_eq!(updated.endpoints[0].id, endpoint_id);
+        assert_eq!(
+            updated.endpoints[0].credentials.password_cipher,
+            existing.endpoints[0].credentials.password_cipher
+        );
     }
 
     #[tokio::test]
@@ -845,7 +1080,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
         let mut candidate = tunnel_input();
-        candidate.credentials.password = None;
+        candidate.endpoints[0].credentials.password = None;
         let error = build_tunnel(candidate, None, &vault, &local_ssh()).unwrap_err();
         assert!(error.contains("密码"), "unexpected: {error}");
     }
@@ -859,12 +1094,12 @@ mod tests {
         let mut edit = tunnel_input();
         edit.id = Some(existing.id.clone());
         edit.name = "NAS 2".into();
-        edit.credentials.password = None; // null keeps the stored value
+        edit.endpoints[0].credentials.password = None; // null keeps the stored value
         let updated = build_tunnel(edit, Some(&existing), &vault, &local_ssh()).unwrap();
         assert_eq!(updated.name, "NAS 2");
         assert_eq!(
-            updated.credentials.password_cipher,
-            existing.credentials.password_cipher
+            updated.endpoints[0].credentials.password_cipher,
+            existing.endpoints[0].credentials.password_cipher
         );
     }
 
@@ -876,7 +1111,7 @@ mod tests {
 
         let mut edit = tunnel_input();
         edit.id = Some(existing.id.clone());
-        edit.credentials = CredentialInput {
+        edit.endpoints[0].credentials = CredentialInput {
             auth_type: AuthType::PrivateKey,
             password: Some(String::new()),
             private_key: Some("-----BEGIN OPENSSH PRIVATE KEY-----".into()),
@@ -884,9 +1119,9 @@ mod tests {
             private_key_path: None,
         };
         let updated = build_tunnel(edit, Some(&existing), &vault, &local_ssh()).unwrap();
-        assert_eq!(updated.credentials.auth_type, AuthType::PrivateKey);
-        assert!(updated.credentials.password_cipher.is_none());
-        assert!(updated.credentials.private_key_cipher.is_some());
+        assert_eq!(updated.endpoints[0].credentials.auth_type, AuthType::PrivateKey);
+        assert!(updated.endpoints[0].credentials.password_cipher.is_none());
+        assert!(updated.endpoints[0].credentials.private_key_cipher.is_some());
     }
 
     #[tokio::test]
@@ -957,15 +1192,19 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
         let local = crate::local_ssh::LocalSsh::at(&ssh_dir);
 
         let mut input = tunnel_input();
-        input.credentials = CredentialInput {
+        input.endpoints[0].credentials = CredentialInput {
             auth_type: AuthType::PrivateKey,
             private_key_path: Some("id_ed25519".into()),
             ..CredentialInput::default()
         };
         let config = build_tunnel(input, None, &vault, &local).unwrap();
-        let cipher = config.credentials.private_key_cipher.unwrap();
+        let cipher = config.endpoints[0]
+            .credentials
+            .private_key_cipher
+            .clone()
+            .unwrap();
         assert_eq!(vault.decrypt(&cipher).unwrap(), key_body);
-        assert!(config.credentials.password_cipher.is_none());
+        assert!(config.endpoints[0].credentials.password_cipher.is_none());
     }
 
     #[tokio::test]
@@ -973,7 +1212,7 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
         let mut input = tunnel_input();
-        input.credentials = CredentialInput {
+        input.endpoints[0].credentials = CredentialInput {
             auth_type: AuthType::PrivateKey,
             private_key_path: Some("nope".into()),
             ..CredentialInput::default()

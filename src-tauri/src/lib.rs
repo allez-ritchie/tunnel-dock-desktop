@@ -1,7 +1,9 @@
 mod commands;
+mod endpoint_policy;
 mod known_hosts;
 mod local_ssh;
 mod model;
+mod network;
 mod portable;
 mod runtime;
 mod secrets;

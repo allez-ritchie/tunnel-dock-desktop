@@ -1,6 +1,6 @@
 use crate::model::{
-    new_id, now_millis, AppGroup, DockSnapshot, ForwardApp, JumpHost, SshCredentials, TunnelConfig,
-    DEFAULT_GROUP_ID, SNAPSHOT_VERSION,
+    new_id, now_millis, AppGroup, DockSnapshot, ForwardApp, JumpHost, SshCredentials,
+    TunnelConfig, TunnelEndpoint, DEFAULT_GROUP_ID, SNAPSHOT_VERSION,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -194,26 +194,167 @@ impl Store {
     }
 }
 
-/// Reads the current document, or migrates the v1 shape: a bare array where each
-/// element mixed SSH access with one forwarding rule.
+/// Reads the stored document in whatever layout it was written with.
+///
+/// **关键坑**：`TunnelConfig` 的所有字段都有默认值，因此用当前 schema 直接解码一份
+/// v2 文档**不会报错**——`host`/`port`/`username` 这些字段会被静默丢弃，得到一堆
+/// 没有任何线路的隧道。所以必须先读 `version` 字段，低于当前版本时改用历史的
+/// `DocumentV2` 布局来解码，再升级成当前结构。
 fn decode_document(raw: &[u8]) -> DockSnapshot {
-    match serde_json::from_slice::<DockSnapshot>(raw) {
-        Ok(document) => document,
-        Err(error) => match serde_json::from_slice::<Vec<LegacyTunnelConfig>>(raw) {
-            Ok(legacy) => {
-                let migrated = migrate_legacy(legacy);
+    let version = document_version(raw);
+    if version >= SNAPSHOT_VERSION {
+        match serde_json::from_slice::<DockSnapshot>(raw) {
+            Ok(document) => return document,
+            Err(error) => tracing::warn!(%error, "当前版本的隧道配置解析失败，尝试迁移旧版"),
+        }
+    }
+    if version >= 2 {
+        match serde_json::from_slice::<DocumentV2>(raw) {
+            Ok(document) => {
+                let migrated = document.into_snapshot();
                 tracing::info!(
                     tunnels = migrated.tunnels.len(),
                     apps = migrated.apps.len(),
-                    "已把旧版隧道配置迁移为隧道 + 应用"
+                    "已把 v2 隧道配置升级为多线路结构"
                 );
-                migrated
+                return migrated;
             }
-            Err(_) => {
-                tracing::error!(%error, "隧道配置 JSON 损坏，暂以空配置启动");
-                DockSnapshot::default()
-            }
-        },
+            Err(error) => tracing::warn!(%error, "v2 隧道配置解析失败，尝试迁移 v1"),
+        }
+    }
+    match serde_json::from_slice::<Vec<LegacyTunnelConfig>>(raw) {
+        Ok(legacy) => {
+            let migrated = migrate_legacy(legacy);
+            tracing::info!(
+                tunnels = migrated.tunnels.len(),
+                apps = migrated.apps.len(),
+                "已把旧版隧道配置迁移为隧道 + 应用"
+            );
+            migrated
+        }
+        Err(error) => {
+            tracing::error!(%error, "隧道配置 JSON 损坏，暂以空配置启动");
+            DockSnapshot::default()
+        }
+    }
+}
+
+/// 读取文档的 `version` 字段；没有该字段的老格式按 0 处理。
+fn document_version(raw: &[u8]) -> u32 {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw) else {
+        return 0;
+    };
+    value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .map(|version| version.min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
+}
+
+/// v2 文档布局：隧道上直接存一对 SSH 接入信息。
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct DocumentV2 {
+    tunnels: Vec<TunnelV2>,
+    apps: Vec<ForwardApp>,
+    groups: Vec<AppGroup>,
+}
+
+impl Default for DocumentV2 {
+    fn default() -> Self {
+        Self {
+            tunnels: Vec::new(),
+            apps: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
+}
+
+impl DocumentV2 {
+    /// v2 → v3：隧道上的 `host`/`port`/`username`/`credentials`/`jumps` 变成
+    /// 唯一的一条线路，命名为隧道名。用户添加第二条线路之前，行为完全不变。
+    fn into_snapshot(self) -> DockSnapshot {
+        DockSnapshot {
+            version: SNAPSHOT_VERSION,
+            tunnels: self.tunnels.into_iter().map(TunnelV2::into_tunnel).collect(),
+            apps: self.apps,
+            groups: if self.groups.is_empty() {
+                vec![AppGroup::default_group()]
+            } else {
+                self.groups
+            },
+        }
+        .normalized()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct TunnelV2 {
+    id: String,
+    name: String,
+    host: String,
+    port: u16,
+    username: String,
+    credentials: SshCredentials,
+    jumps: Vec<JumpHost>,
+    auto_reconnect: bool,
+    keep_alive_seconds: u32,
+    connect_timeout_seconds: u32,
+    strict_host_key: bool,
+    created_at: u64,
+    updated_at: u64,
+}
+
+impl Default for TunnelV2 {
+    fn default() -> Self {
+        Self {
+            id: new_id(),
+            name: String::new(),
+            host: String::new(),
+            port: crate::model::DEFAULT_SSH_PORT,
+            username: String::new(),
+            credentials: SshCredentials::default(),
+            jumps: Vec::new(),
+            auto_reconnect: true,
+            keep_alive_seconds: crate::model::DEFAULT_KEEPALIVE_SECONDS,
+            connect_timeout_seconds: crate::model::DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            strict_host_key: true,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+}
+
+impl TunnelV2 {
+    fn into_tunnel(self) -> TunnelConfig {
+        let label = if self.name.trim().is_empty() {
+            self.host.trim().to_string()
+        } else {
+            self.name.trim().to_string()
+        };
+        TunnelConfig {
+            id: self.id,
+            name: self.name,
+            endpoints: vec![TunnelEndpoint {
+                label,
+                host: self.host,
+                port: self.port,
+                username: self.username,
+                credentials: self.credentials,
+                jumps: self.jumps,
+                wifi_only: false,
+                enabled: true,
+                ..TunnelEndpoint::default()
+            }],
+            auto_reconnect: self.auto_reconnect,
+            keep_alive_seconds: self.keep_alive_seconds,
+            connect_timeout_seconds: self.connect_timeout_seconds,
+            strict_host_key: self.strict_host_key,
+            preferred_endpoint_id: None,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
     }
 }
 
@@ -249,6 +390,8 @@ fn legacy_endpoint_key(
     )
 }
 
+/// v1 迁移：同一个 SSH 接入信息被多条旧配置共用时，只保留一条隧道，
+/// 并把它当作该隧道唯一的一条线路。
 fn migrate_legacy(legacy: Vec<LegacyTunnelConfig>) -> DockSnapshot {
     let mut document = DockSnapshot {
         version: SNAPSHOT_VERSION,
@@ -270,13 +413,15 @@ fn migrate_legacy(legacy: Vec<LegacyTunnelConfig>) -> DockSnapshot {
             .tunnels
             .iter()
             .find(|tunnel| {
-                legacy_endpoint_key(
-                    &tunnel.ssh_host,
-                    tunnel.ssh_port,
-                    &tunnel.ssh_user,
-                    &tunnel.credentials,
-                    &tunnel.jumps,
-                ) == key
+                tunnel.endpoints.iter().any(|endpoint| {
+                    legacy_endpoint_key(
+                        &endpoint.host,
+                        endpoint.port,
+                        &endpoint.username,
+                        &endpoint.credentials,
+                        &endpoint.jumps,
+                    ) == key
+                })
             })
             .map(|tunnel| tunnel.id.clone())
             .unwrap_or_else(|| {
@@ -300,16 +445,23 @@ fn migrate_legacy(legacy: Vec<LegacyTunnelConfig>) -> DockSnapshot {
                 );
                 document.tunnels.push(TunnelConfig {
                     id: id.clone(),
-                    name,
-                    ssh_host: old.ssh_host.clone(),
-                    ssh_port: old.ssh_port,
-                    ssh_user: old.ssh_user.clone(),
-                    credentials: old.credentials.clone(),
-                    jumps: old.jumps.clone(),
+                    name: name.clone(),
+                    endpoints: vec![TunnelEndpoint {
+                        label: name,
+                        host: old.ssh_host.clone(),
+                        port: old.ssh_port,
+                        username: old.ssh_user.clone(),
+                        credentials: old.credentials.clone(),
+                        jumps: old.jumps.clone(),
+                        wifi_only: false,
+                        enabled: true,
+                        ..TunnelEndpoint::default()
+                    }],
                     auto_reconnect: old.auto_reconnect,
                     keep_alive_seconds: old.keep_alive_seconds,
                     connect_timeout_seconds: old.connect_timeout_seconds,
                     strict_host_key: old.strict_host_key,
+                    preferred_endpoint_id: None,
                     created_at: old.created_at,
                     updated_at: old.updated_at,
                 });
@@ -399,8 +551,17 @@ mod tests {
     fn tunnel(name: &str) -> TunnelConfig {
         TunnelConfig {
             name: name.into(),
-            ssh_host: "example.com".into(),
-            ssh_user: "ops".into(),
+            endpoints: vec![TunnelEndpoint {
+                label: name.into(),
+                host: "example.com".into(),
+                username: "ops".into(),
+                credentials: SshCredentials {
+                    auth_type: crate::model::AuthType::Password,
+                    password_cipher: Some("v1.aa.bb".into()),
+                    ..SshCredentials::default()
+                },
+                ..TunnelEndpoint::default()
+            }],
             ..TunnelConfig::default()
         }
     }
@@ -535,6 +696,8 @@ mod tests {
         assert_eq!(document.tunnels.len(), 1, "same SSH endpoint is reused");
         assert_eq!(document.tunnels[0].id, "old-1");
         assert_eq!(document.tunnels[0].name, "ops@example.com");
+        assert_eq!(document.tunnels[0].endpoints.len(), 1);
+        assert_eq!(document.tunnels[0].endpoints[0].host, "example.com");
         assert_eq!(document.apps.len(), 2);
         assert!(document.apps.iter().all(|app| app.tunnel_id == "old-1"));
         assert!(document.apps.iter().all(|app| app.group_id == "default"));
@@ -549,6 +712,125 @@ mod tests {
         let document = decode_document(b"{not json");
         assert!(document.tunnels.is_empty());
         assert!(document.groups.iter().any(AppGroup::is_default));
+    }
+
+    /// 关键回归：用当前 schema 直接解码 v2 文档不会报错，只会静默丢掉
+    /// `host`/`port`/`username`，得到一堆空隧道。必须先看 `version` 字段。
+    #[tokio::test]
+    async fn migrates_a_v2_document_into_a_single_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = serde_json::json!({
+            "version": 2,
+            "tunnels": [{
+                "id": "t1",
+                "name": "公司跳板",
+                "host": "example.com",
+                "port": 2222,
+                "username": "ops",
+                "credentials": { "authType": "password", "passwordCipher": "v1.aa.bb" },
+                "jumps": [{
+                    "id": "j1",
+                    "label": "堡垒机",
+                    "host": "bastion",
+                    "port": 22,
+                    "username": "ops",
+                    "credentials": { "authType": "password", "passwordCipher": "v1.jj.kk" }
+                }],
+                "autoReconnect": false,
+                "keepAliveSeconds": 45,
+                "connectTimeoutSeconds": 20,
+                "strictHostKey": false,
+                "createdAt": 11,
+                "updatedAt": 12
+            }],
+            "apps": [{
+                "id": "a1",
+                "name": "NAS",
+                "groupId": "default",
+                "tunnelId": "t1",
+                "localPort": 18080,
+                "remoteHost": "10.0.0.5",
+                "remotePort": 5000
+            }],
+            "groups": [{ "id": "default", "name": "default", "createdAt": 0 }]
+        });
+        let path = dir.path().join(FILE_NAME);
+        tokio::fs::create_dir_all(dir.path()).await.unwrap();
+        tokio::fs::write(&path, serde_json::to_vec(&v2).unwrap())
+            .await
+            .unwrap();
+
+        let store = Store::load(dir.path()).await.unwrap();
+        let document = store.snapshot().await;
+        assert_eq!(document.version, SNAPSHOT_VERSION);
+        assert_eq!(document.tunnels.len(), 1);
+        let tunnel = &document.tunnels[0];
+        assert_eq!(tunnel.name, "公司跳板");
+        assert_eq!(tunnel.endpoints.len(), 1, "v2 的一对 SSH 信息变成一条线路");
+        assert_eq!(tunnel.endpoints[0].host, "example.com");
+        assert_eq!(tunnel.endpoints[0].port, 2222);
+        assert_eq!(tunnel.endpoints[0].username, "ops");
+        assert_eq!(tunnel.endpoints[0].label, "公司跳板");
+        assert_eq!(tunnel.endpoints[0].jumps.len(), 1);
+        assert!(tunnel.endpoints[0].enabled);
+        assert!(!tunnel.endpoints[0].wifi_only);
+        assert!(tunnel.preferred_endpoint_id.is_none());
+        // 隧道级设置必须原样保留，不能被默认值覆盖。
+        assert!(!tunnel.auto_reconnect);
+        assert_eq!(tunnel.keep_alive_seconds, 45);
+        assert_eq!(tunnel.connect_timeout_seconds, 20);
+        assert!(!tunnel.strict_host_key);
+        assert_eq!(tunnel.created_at, 11);
+        assert_eq!(document.apps.len(), 1);
+        assert_eq!(document.apps[0].tunnel_id, "t1");
+    }
+
+    /// 迁移结果只是内存中的结构；下一次写入才会把文档升级为 v3。
+    #[tokio::test]
+    async fn the_migrated_document_is_written_back_as_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        tokio::fs::create_dir_all(dir.path()).await.unwrap();
+        let v2 = serde_json::json!({
+            "version": 2,
+            "tunnels": [{
+                "id": "t1", "name": "NAS", "host": "example.com", "port": 22, "username": "ops"
+            }]
+        });
+        tokio::fs::write(&path, serde_json::to_vec(&v2).unwrap())
+            .await
+            .unwrap();
+        let store = Store::load(dir.path()).await.unwrap();
+        store.set_app_desired("nothing", true).await.unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(raw["version"], SNAPSHOT_VERSION);
+        assert_eq!(raw["tunnels"][0]["endpoints"][0]["host"], "example.com");
+        // v2 的扁平字段不再写出。
+        assert!(raw["tunnels"][0].get("sshHost").is_none());
+    }
+
+    /// 一份当前文档必须原样读回，不能被 v2 迁移逻辑误伤。
+    #[tokio::test]
+    async fn a_current_document_round_trips_without_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::load(dir.path()).await.unwrap();
+        store.upsert_tunnel(tunnel("多线路")).await.unwrap();
+        let reloaded = Store::load(dir.path()).await.unwrap();
+        let document = reloaded.snapshot().await;
+        assert_eq!(document.tunnels.len(), 1);
+        assert_eq!(document.tunnels[0].endpoints.len(), 1);
+        assert_eq!(document.tunnels[0].endpoints[0].host, "example.com");
+    }
+
+    #[test]
+    fn the_document_version_is_read_from_any_layout() {
+        assert_eq!(document_version(br#"{"version":3}"#), 3);
+        assert_eq!(document_version(br#"{"version":2,"tunnels":[]}"#), 2);
+        assert_eq!(document_version(br#"{"tunnels":[]}"#), 0);
+        assert_eq!(document_version(br#"[{"id":"x"}]"#), 0);
+        assert_eq!(document_version(b"not json"), 0);
     }
 
     #[test]

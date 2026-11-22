@@ -40,6 +40,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 open = "5"
 # 只导出/导入我们自己写的清单文件，因此只需要 deflate，不引入加密、zstd、lzma 等特性。
 zip = { version = "7", default-features = false, features = ["deflate"] }
+# 判断本机是否连接着局域网，用于“仅局域网可用”的隧道线路。
+if-addrs = "0.15"
 
 [dev-dependencies]
 tempfile = "3"
