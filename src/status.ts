@@ -1,10 +1,4 @@
-import type {
-  AppStatus,
-  AppView,
-  EndpointSelection,
-  GroupView,
-  TunnelView,
-} from "./api";
+import type { AppStatus, AppView, GroupView, TunnelView } from "./api";
 
 /**
  * Resolves the status to render for one application.
@@ -24,7 +18,7 @@ export function resolveAppStatus(
   // A blocked status is sticky: keep explaining why until the app is restarted.
   if (existing && existing.blockReason !== "none") return existing;
 
-  if (!tunnels.some((tunnel) => tunnel.id === app.tunnelId)) {
+  if (!appHasKnownTunnel(app, tunnels)) {
     return staticBlocked(app, "tunnel_deleted");
   }
   if (!groups.some((group) => group.id === app.groupId)) {
@@ -42,11 +36,55 @@ export function resolveAppStatus(
       errorCode: null,
       errorDetail: null,
       securityAlert: false,
-      endpoint: null,
-      endpointFailures: [],
+      tunnel: null,
+      tunnelFailures: [],
       updatedAt: Date.now(),
     }
   );
+}
+
+/** 应用引用的隧道里至少还有一条存在。 */
+export function appHasKnownTunnel(
+  app: Pick<AppView, "tunnelIds">,
+  tunnels: TunnelView[],
+): boolean {
+  if (app.tunnelIds.length === 0) return false;
+  return app.tunnelIds.some((id) => tunnels.some((tunnel) => tunnel.id === id));
+}
+
+/**
+ * 应用当前实际使用的隧道：优先取运行状态里记录的，其次按声明顺序找第一条
+ * 还存在的。返回 `undefined` 说明应用引用的隧道全都被删了。
+ */
+export function activeTunnel(
+  app: Pick<AppView, "tunnelIds">,
+  tunnels: TunnelView[],
+  status?: AppStatus,
+): TunnelView | undefined {
+  const live = status?.tunnel?.tunnelId;
+  if (live !== undefined) {
+    const found = tunnels.find((tunnel) => tunnel.id === live);
+    if (found) return found;
+  }
+  return appTunnels(app, tunnels)[0];
+}
+
+/** 应用按顺序持有的隧道，引用不到的跳过。 */
+export function appTunnels(
+  app: Pick<AppView, "tunnelIds">,
+  tunnels: TunnelView[],
+): TunnelView[] {
+  return app.tunnelIds
+    .map((id) => tunnels.find((tunnel) => tunnel.id === id))
+    .filter((tunnel): tunnel is TunnelView => tunnel !== undefined);
+}
+
+/** 首选隧道：应用声明顺序里的第一条（不是实际在用的那条）。 */
+export function primaryTunnel(
+  app: Pick<AppView, "tunnelIds">,
+  tunnels: TunnelView[],
+): TunnelView | undefined {
+  return appTunnels(app, tunnels)[0];
 }
 
 function staticBlocked(
@@ -64,8 +102,8 @@ function staticBlocked(
     errorCode: reason,
     errorDetail: null,
     securityAlert: false,
-    endpoint: null,
-    endpointFailures: [],
+    tunnel: null,
+    tunnelFailures: [],
     updatedAt: Date.now(),
   };
 }
@@ -84,39 +122,25 @@ export function appUnavailable(
   );
 }
 
-/**
- * 隧道是否有一条现在就能拨号的线路。没有的话应用同样“不可用”，
- * 但原因不是连接失败而是配置缺失，界面据此给出可执行的提示。
- */
-export function tunnelHasDialableEndpoint(tunnel: TunnelView | undefined): boolean {
-  return tunnel !== undefined && tunnel.endpoints.some((item) => item.dialable);
-}
-
-/** 线路名，没有线路时回落到占位符。 */
-export function endpointLabel(endpoint: EndpointSelection | null | undefined): string {
-  return endpoint?.label ?? "—";
+/** 隧道自身的接入信息是否完整（地址 / 用户名 / 端口 / 凭据）。 */
+export function tunnelHasDialableEndpoint(
+  tunnel: TunnelView | undefined,
+): boolean {
+  return tunnel !== undefined && tunnel.dialable;
 }
 
 /**
- * 该应用当前是否靠“下一条线路”在工作：用来在卡片上提示
- * “首选线路不可用，已切换到 X”。切到自己就说明没发生回退。
+ * 该应用当前是否靠“下一条隧道”在工作：用来在卡片上提示
+ * “首选隧道不可用，已切换到 X”。用首选隧道本身时说明没发生回退。
  */
 export function usedFallback(
   status: AppStatus,
-  tunnel: TunnelView | undefined,
+  app: Pick<AppView, "tunnelIds">,
 ): boolean {
-  if (status.endpointFailures.length === 0) return false;
+  // 只有配置了多个入口才谈得上“切换”：单入口失败后重连成功不算回退。
+  if (app.tunnelIds.length < 2) return false;
+  if (status.tunnelFailures.length === 0) return false;
   if (status.phase !== "connected") return false;
-  const preferred = tunnel?.preferredEndpointId ?? null;
-  if (preferred === null) return false;
-  return status.endpoint?.endpointId !== preferred;
-}
-
-/** 首选线路本身，界面在“回退”提示里要引用它的名字。 */
-export function preferredEndpoint(tunnel: TunnelView | undefined) {
-  if (!tunnel) return undefined;
-  return (
-    tunnel.endpoints.find((item) => item.id === tunnel.preferredEndpointId) ??
-    tunnel.endpoints[0]
-  );
+  const preferred = app.tunnelIds[0];
+  return status.tunnel?.tunnelId !== preferred;
 }

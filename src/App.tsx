@@ -25,7 +25,7 @@ type OverlaySpec =
   | {
       kind: "app-editor";
       appId: string | null;
-      defaults: { groupId: string; tunnelId: string; localPort: number };
+      defaults: { groupId: string; tunnelIds: string[]; localPort: number };
     }
   | { kind: "tunnel-editor"; tunnelId: string | null }
   | { kind: "ssh-config-import" }
@@ -200,7 +200,7 @@ export default function App() {
       appId: null,
       defaults: {
         groupId: groupId ?? dock.groups[0]?.id ?? "default",
-        tunnelId: dock.tunnels[0]?.id ?? "",
+        tunnelIds: dock.tunnels[0] ? [dock.tunnels[0].id] : [],
         localPort: nextPort(dock.apps),
       },
     });
@@ -210,7 +210,7 @@ export default function App() {
     push({
       kind: "app-editor",
       appId: id,
-      defaults: { groupId: "default", tunnelId: "", localPort: 18080 },
+      defaults: { groupId: "default", tunnelIds: [], localPort: 18080 },
     });
   }
 
@@ -253,7 +253,9 @@ export default function App() {
   }
 
   async function saveTunnel(input: TunnelInput) {
-    const affected = dock.apps.filter((app) => app.tunnelId === input.id).length;
+    const affected = dock.apps.filter((app) =>
+      input.id !== null && app.tunnelIds.includes(input.id),
+    ).length;
     const saved = await api.saveTunnel(input);
     await refreshDock();
     setOverlays((current) => {
@@ -264,7 +266,7 @@ export default function App() {
       if (top?.kind === "app-editor" && top.appId === null) {
         next[next.length - 1] = {
           ...top,
-          defaults: { ...top.defaults, tunnelId: saved.id },
+          defaults: { ...top.defaults, tunnelIds: [saved.id] },
         };
       }
       return next;
@@ -289,7 +291,7 @@ export default function App() {
   }
 
   async function deleteTunnel(id: string) {
-    const affected = dock.apps.filter((app) => app.tunnelId === id).length;
+    const affected = dock.apps.filter((app) => app.tunnelIds.includes(id)).length;
     await api.deleteTunnel(id);
     await refreshDock();
     setOverlays((current) => {
@@ -336,8 +338,6 @@ export default function App() {
           errorCode: "generic",
           errorDetail: errorMessage(error),
           securityAlert: false,
-          endpointLabel: null,
-          endpointFailures: [],
         },
       }));
     }
@@ -384,7 +384,7 @@ export default function App() {
           initial={initial}
           usedBy={
             initial
-              ? dock.apps.filter((app) => app.tunnelId === initial.id)
+              ? dock.apps.filter((app) => app.tunnelIds.includes(initial.id))
               : []
           }
           onClose={pop}
@@ -410,7 +410,7 @@ export default function App() {
     return (
       <ErrorDetailScreen
         app={app}
-        tunnel={app ? tunnelMap.get(app.tunnelId) : undefined}
+        tunnels={dock.tunnels}
         group={app ? groupMap.get(app.groupId) : undefined}
         status={status}
         onBack={pop}

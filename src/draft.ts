@@ -2,8 +2,6 @@ import type {
   AppInput,
   AppView,
   AuthType,
-  EndpointInput,
-  EndpointView,
   GroupView,
   JumpInput,
   JumpView,
@@ -35,12 +33,13 @@ export interface JumpForm {
 }
 
 /**
- * 一条 SSH 线路的可编辑状态。一条隧道可以有多条线路，它们是“到达同一台
- * SSH 服务器的不同入口”，应用看到的本地端口始终不变。
+ * 一条隧道的可编辑状态：一次确定的 SSH 接入（用户名 / 地址 / 端口 / 跳板 / 凭据）。
+ *
+ * “多个入口”不再属于隧道：应用持有有序的隧道列表，本地端口始终不变。
  */
-export interface EndpointForm {
+export interface TunnelForm {
   id: string | null;
-  label: string;
+  name: string;
   host: string;
   port: string;
   username: string;
@@ -56,16 +55,6 @@ export interface EndpointForm {
   hasPrivateKey: boolean;
   hasPassphrase: boolean;
   jumps: JumpForm[];
-  /** 只在局域网（有线 / Wi-Fi）可用，例如家里的那台服务器。 */
-  wifiOnly: boolean;
-  enabled: boolean;
-}
-
-export interface TunnelForm {
-  id: string | null;
-  name: string;
-  endpoints: EndpointForm[];
-  preferredEndpointId: string | null;
   autoReconnect: boolean;
   strictHostKey: boolean;
   keepAliveSeconds: string;
@@ -76,7 +65,8 @@ export interface AppForm {
   id: string | null;
   name: string;
   groupId: string;
-  tunnelId: string;
+  /** 按尝试顺序排列的隧道 id，第一条是首选。 */
+  tunnelIds: string[];
   localPort: string;
   remoteHost: string;
   remotePort: string;
@@ -85,7 +75,7 @@ export interface AppForm {
 }
 
 export const MAX_JUMPS = 8;
-export const MAX_ENDPOINTS = 8;
+export const MAX_APP_TUNNELS = 8;
 
 export function nextPort(apps: AppView[]): number {
   const used = new Set(apps.map((app) => app.localPort));
@@ -93,13 +83,6 @@ export function nextPort(apps: AppView[]): number {
     if (!used.has(port)) return port;
   }
   return 18080;
-}
-
-/** "线路 1"、"线路 2"……跳过已经用掉的名字。 */
-export function nextEndpointLabel(existing: string[]): string {
-  let index = existing.length + 1;
-  while (existing.includes(strings.endpointDefaultLabel(index))) index += 1;
-  return strings.endpointDefaultLabel(index);
 }
 
 export function jumpFormFrom(jump?: JumpView): JumpForm {
@@ -124,17 +107,14 @@ export function jumpFormFrom(jump?: JumpView): JumpForm {
   };
 }
 
-export function endpointFormFrom(
-  endpoint?: EndpointView,
-  defaultLabel = "",
-): EndpointForm {
+export function tunnelFormFrom(tunnel?: TunnelView): TunnelForm {
   return {
-    id: endpoint?.id ?? null,
-    label: endpoint?.label ?? defaultLabel,
-    host: endpoint?.host ?? "",
-    port: String(endpoint?.port ?? 22),
-    username: endpoint?.username ?? "root",
-    authType: endpoint?.credentials.authType ?? "password",
+    id: tunnel?.id ?? null,
+    name: tunnel?.name ?? "",
+    host: tunnel?.host ?? "",
+    port: String(tunnel?.port ?? 22),
+    username: tunnel?.username ?? "root",
+    authType: tunnel?.credentials.authType ?? "password",
     passwordInput: "",
     passwordCleared: false,
     privateKeyInput: "",
@@ -142,22 +122,10 @@ export function endpointFormFrom(
     privateKeyPath: null,
     passphraseInput: "",
     passphraseCleared: false,
-    hasPassword: endpoint?.credentials.hasPassword ?? false,
-    hasPrivateKey: endpoint?.credentials.hasPrivateKey ?? false,
-    hasPassphrase: endpoint?.credentials.hasPassphrase ?? false,
-    jumps: endpoint?.jumps.map((jump) => jumpFormFrom(jump)) ?? [],
-    wifiOnly: endpoint?.wifiOnly ?? false,
-    enabled: endpoint?.enabled ?? true,
-  };
-}
-
-export function tunnelFormFrom(tunnel?: TunnelView): TunnelForm {
-  return {
-    id: tunnel?.id ?? null,
-    name: tunnel?.name ?? "",
-    endpoints:
-      tunnel?.endpoints.map((endpoint) => endpointFormFrom(endpoint)) ?? [],
-    preferredEndpointId: tunnel?.preferredEndpointId ?? null,
+    hasPassword: tunnel?.credentials.hasPassword ?? false,
+    hasPrivateKey: tunnel?.credentials.hasPrivateKey ?? false,
+    hasPassphrase: tunnel?.credentials.hasPassphrase ?? false,
+    jumps: tunnel?.jumps.map((jump) => jumpFormFrom(jump)) ?? [],
     autoReconnect: tunnel?.autoReconnect ?? true,
     strictHostKey: tunnel?.strictHostKey ?? true,
     keepAliveSeconds: String(tunnel?.keepAliveSeconds ?? 30),
@@ -167,13 +135,13 @@ export function tunnelFormFrom(tunnel?: TunnelView): TunnelForm {
 
 export function appFormFrom(
   app?: AppView,
-  defaults?: { groupId?: string; tunnelId?: string; localPort?: number },
+  defaults?: { groupId?: string; tunnelIds?: string[]; localPort?: number },
 ): AppForm {
   return {
     id: app?.id ?? null,
     name: app?.name ?? "",
     groupId: app?.groupId ?? defaults?.groupId ?? "default",
-    tunnelId: app?.tunnelId ?? defaults?.tunnelId ?? "",
+    tunnelIds: app?.tunnelIds ?? defaults?.tunnelIds ?? [],
     localPort: String(app?.localPort ?? defaults?.localPort ?? 18080),
     remoteHost: app?.remoteHost ?? "127.0.0.1",
     remotePort: String(app?.remotePort ?? 80),
@@ -186,20 +154,20 @@ export function signature(form: TunnelForm | AppForm): string {
   return JSON.stringify(form);
 }
 
-export function hasSavedPassword(form: JumpForm | EndpointForm): boolean {
+export function hasSavedPassword(form: JumpForm | TunnelForm): boolean {
   return form.hasPassword && !form.passwordCleared;
 }
 
-export function hasSavedPrivateKey(form: JumpForm | EndpointForm): boolean {
+export function hasSavedPrivateKey(form: JumpForm | TunnelForm): boolean {
   return (form.hasPrivateKey && !form.privateKeyCleared) || usesLocalKey(form);
 }
 
 /** 是否选择了 `~/.ssh` 里的私钥文件（保存在本机，不在表单里传内容）。 */
-export function usesLocalKey(form: JumpForm | EndpointForm): boolean {
+export function usesLocalKey(form: JumpForm | TunnelForm): boolean {
   return (form.privateKeyPath ?? "").trim() !== "";
 }
 
-export function hasSavedPassphrase(form: JumpForm | EndpointForm): boolean {
+export function hasSavedPassphrase(form: JumpForm | TunnelForm): boolean {
   return form.hasPassphrase && !form.passphraseCleared;
 }
 
@@ -237,50 +205,35 @@ export function jumpError(jump: JumpForm): string | null {
   return null;
 }
 
-/** 一条线路自身是否完整，返回第一条错误信息或 `null`。 */
-export function endpointError(endpoint: EndpointForm): string | null {
-  if ([...endpoint.label.trim()].length > 40) {
-    return strings.errorEndpointLabelTooLong;
+/** 一条隧道自身是否完整，返回第一条错误信息或 `null`。 */
+export function tunnelError(tunnel: TunnelForm): string | null {
+  if (tunnel.host.trim() === "" || /\s/.test(tunnel.host)) {
+    return strings.errorTunnelHostRequired;
   }
-  if (endpoint.host.trim() === "" || /\s/.test(endpoint.host)) {
-    return strings.errorEndpointHostRequired;
-  }
-  const port = parsePort(endpoint.port);
+  const port = parsePort(tunnel.port);
   if (port === null || port < 1 || port > 65535) {
-    return strings.errorEndpointPort;
+    return strings.errorTunnelPort;
   }
-  if (endpoint.username.trim() === "") {
-    return strings.errorEndpointUsernameRequired;
+  if (tunnel.username.trim() === "") {
+    return strings.errorTunnelUsernameRequired;
   }
-  if (endpoint.authType === "password") {
-    if (!hasSavedPassword(endpoint) && endpoint.passwordInput === "") {
-      return strings.errorEndpointPasswordRequired;
+  if (tunnel.authType === "password") {
+    if (!hasSavedPassword(tunnel) && tunnel.passwordInput === "") {
+      return strings.errorTunnelPasswordRequired;
     }
   } else if (
-    !hasSavedPrivateKey(endpoint) &&
-    endpoint.privateKeyInput.trim() === ""
+    !hasSavedPrivateKey(tunnel) &&
+    tunnel.privateKeyInput.trim() === ""
   ) {
-    return strings.errorEndpointPrivateKeyRequired;
+    return strings.errorTunnelPrivateKeyRequired;
   }
-  if (endpoint.jumps.length > MAX_JUMPS) {
+  if (tunnel.jumps.length > MAX_JUMPS) {
     return strings.errorMaxJumps;
   }
-  if (endpoint.jumps.some((jump) => jumpError(jump) !== null)) {
+  if (tunnel.jumps.some((jump) => jumpError(jump) !== null)) {
     return strings.errorJumpInvalid;
   }
   return null;
-}
-
-/** 线路名不允许重复，否则日志与卡片里分不清是哪条路。 */
-export function duplicateEndpointLabel(
-  endpoints: EndpointForm[],
-  index: number,
-): boolean {
-  const label = endpoints[index].label.trim();
-  if (label === "") return false;
-  return endpoints.some(
-    (endpoint, other) => other !== index && endpoint.label.trim() === label,
-  );
 }
 
 export function validateTunnel(form: TunnelForm): FormErrors {
@@ -298,25 +251,8 @@ export function validateTunnel(form: TunnelForm): FormErrors {
     errors.connectTimeoutSeconds = strings.errorTimeout;
   }
 
-  if (form.endpoints.length === 0) {
-    errors.endpoints = strings.errorEndpointRequired;
-  } else if (form.endpoints.length > MAX_ENDPOINTS) {
-    errors.endpoints = strings.errorMaxEndpoints;
-  } else if (!form.endpoints.some((endpoint) => endpoint.enabled)) {
-    errors.endpoints = strings.errorEndpointAllDisabled;
-  } else {
-    for (const [index, endpoint] of form.endpoints.entries()) {
-      if (duplicateEndpointLabel(form.endpoints, index)) {
-        errors.endpoints = strings.errorEndpointLabelDuplicate;
-        break;
-      }
-      const error = endpointError(endpoint);
-      if (error !== null) {
-        errors.endpoints = error;
-        break;
-      }
-    }
-  }
+  const tunnelProblem = tunnelError(form);
+  if (tunnelProblem !== null) errors.access = tunnelProblem;
 
   return errors;
 }
@@ -334,8 +270,18 @@ export function validateApp(
   if (!groups.some((group) => group.id === form.groupId)) {
     errors.groupId = strings.errorGroupRequired;
   }
-  if (!tunnels.some((tunnel) => tunnel.id === form.tunnelId)) {
-    errors.tunnelId = strings.errorTunnelRequired;
+
+  const known = new Set(tunnels.map((tunnel) => tunnel.id));
+  const chosen = form.tunnelIds;
+  if (chosen.length === 0) {
+    errors.tunnelIds = strings.errorTunnelRequired;
+  } else if (chosen.some((id) => !known.has(id))) {
+    errors.tunnelIds = strings.errorAppTunnelMissing;
+  } else if (chosen.length > MAX_APP_TUNNELS) {
+    errors.tunnelIds = strings.errorMaxAppTunnels;
+  } else if (!chosen.some((id) => tunnels.find((t) => t.id === id)?.dialable)) {
+    // 选了隧道但一条都拨不出去：与其让用户点“启动”后才发现，不如在这里拦住。
+    errors.tunnelIds = strings.errorNoDialableTunnel;
   }
 
   const localPort = parsePort(form.localPort);
@@ -363,7 +309,7 @@ export function validateApp(
   return errors;
 }
 
-function credentialInput(form: JumpForm | EndpointForm) {
+function credentialInput(form: JumpForm | TunnelForm) {
   return {
     authType: form.authType,
     password: form.passwordCleared
@@ -399,36 +345,19 @@ export function toJumpInput(jump: JumpForm): JumpInput {
   };
 }
 
-export function toEndpointInput(endpoint: EndpointForm): EndpointInput {
-  return {
-    id: endpoint.id,
-    label: endpoint.label.trim(),
-    host: endpoint.host.trim(),
-    port: Number(endpoint.port),
-    username: endpoint.username.trim(),
-    credentials: credentialInput(endpoint),
-    jumps: endpoint.jumps.map(toJumpInput),
-    wifiOnly: endpoint.wifiOnly,
-    enabled: endpoint.enabled,
-  };
-}
-
 export function toTunnelInput(form: TunnelForm): TunnelInput {
-  // 首选线路必须确实存在；指向一条已被删掉的线路时回落到自动。
-  const preferred =
-    form.preferredEndpointId !== null &&
-    form.endpoints.some((endpoint) => endpoint.id === form.preferredEndpointId)
-      ? form.preferredEndpointId
-      : null;
   return {
     id: form.id,
     name: form.name.trim(),
-    endpoints: form.endpoints.map(toEndpointInput),
+    host: form.host.trim(),
+    port: Number(form.port),
+    username: form.username.trim(),
+    credentials: credentialInput(form),
+    jumps: form.jumps.map(toJumpInput),
     autoReconnect: form.autoReconnect,
     keepAliveSeconds: Number(form.keepAliveSeconds),
     connectTimeoutSeconds: Number(form.connectTimeoutSeconds),
     strictHostKey: form.strictHostKey,
-    preferredEndpointId: preferred,
   };
 }
 
@@ -437,7 +366,10 @@ export function toAppInput(form: AppForm): AppInput {
     id: form.id,
     name: form.name.trim(),
     groupId: form.groupId,
-    tunnelId: form.tunnelId,
+    // 去重但保持顺序：第一条就是首选隧道。
+    tunnelIds: form.tunnelIds.filter(
+      (id, index) => form.tunnelIds.indexOf(id) === index,
+    ),
     localPort: Number(form.localPort),
     remoteHost: form.remoteHost.trim(),
     remotePort: Number(form.remotePort),
@@ -446,25 +378,42 @@ export function toAppInput(form: AppForm): AppInput {
   };
 }
 
-/** 一条线路的链路预览：跳板 → SSH 服务器。 */
-export function endpointChainPreview(endpoint: EndpointForm): string {
-  const hops = endpoint.jumps.map((jump) => jump.label || jump.host || "?");
-  hops.push(endpoint.host || strings.editorServerPlaceholder);
+/** 一条隧道的链路预览：跳板 → SSH 服务器。 */
+export function tunnelChainPreview(tunnel: TunnelForm): string {
+  const hops = tunnel.jumps.map((jump) => jump.label || jump.host || "?");
+  hops.push(tunnel.host || strings.editorServerPlaceholder);
   return hops.join("  →  ");
 }
 
 /**
- * 编辑器顶部的链路预览。布局与后端 `primary_endpoint()` 一致：首选线路优先，
- * 否则第一条线路；一条线路都没有时给出占位文案。
+ * 编辑器顶部的链路预览：当前隧道自己的接入路径。没有地址时给出占位文案，
+ * 让新表单里也有可读的标题。
  */
 export function chainPreview(form: TunnelForm): string {
-  const preferred =
-    form.endpoints.find(
-      (endpoint) => endpoint.id !== null && endpoint.id === form.preferredEndpointId,
-    ) ?? form.endpoints[0];
-  if (!preferred) return strings.editorNoEndpoint;
-  const preview = endpointChainPreview(preferred);
-  return form.endpoints.length > 1
-    ? `${preview}  ${strings.endpointCountSuffix(form.endpoints.length)}`
-    : preview;
+  if (form.host.trim() === "" && form.jumps.length === 0) {
+    return strings.editorNoEndpoint;
+  }
+  return tunnelChainPreview(form);
+}
+
+/**
+ * 应用要尝试的隧道，按应用里的顺序；引用不到（已删除）的跳过。
+ * 卡片、错误详情页都用它描述“会走哪几条路”。
+ */
+export function appTunnels(
+  form: Pick<AppForm, "tunnelIds">,
+  tunnels: TunnelView[],
+): TunnelView[] {
+  const byId = new Map(tunnels.map((tunnel) => [tunnel.id, tunnel]));
+  return form.tunnelIds
+    .map((id) => byId.get(id))
+    .filter((tunnel): tunnel is TunnelView => tunnel !== undefined);
+}
+
+/** 应用选择的隧道里有没有一条现在就能拨号。 */
+export function appHasDialableTunnel(
+  form: Pick<AppForm, "tunnelIds">,
+  tunnels: TunnelView[],
+): boolean {
+  return appTunnels(form, tunnels).some((tunnel) => tunnel.dialable);
 }

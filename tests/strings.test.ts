@@ -15,21 +15,16 @@ describe("describeError", () => {
     expect(describeError("port_in_use", null)).toBe(strings.errorPortInUse(0));
   });
 
-  it("explains why no endpoint could be dialed", () => {
-    expect(describeError("no_endpoint", null, null, "家庭 NAS")).toContain(
-      "家庭 NAS",
+  it("explains why no tunnel could be dialed", () => {
+    expect(describeError("no_tunnel", null)).toBe(strings.errorNoTunnel);
+    expect(describeError("tunnel_missing", null)).toBe(
+      strings.errorTunnelMissing,
     );
-    expect(describeError("all_endpoints_disabled", null)).toBe(
-      strings.errorAllEndpointsDisabled,
+    expect(describeError("tunnel_incomplete", null)).toBe(
+      strings.errorTunnelIncomplete,
     );
-    expect(describeError("wifi_only_endpoint", null)).toBe(
-      strings.errorWifiOnlyEndpoint,
-    );
-    expect(describeError("endpoint_incomplete", null)).toBe(
-      strings.errorEndpointIncomplete,
-    );
-    // 不知道隧道名时也不能出现 undefined。
-    expect(describeError("no_endpoint", null)).not.toContain("undefined");
+    // 文案里不能出现 undefined。
+    expect(describeError("no_tunnel", null)).not.toContain("undefined");
   });
 
   it("maps dangling references to actionable copy", () => {
@@ -106,20 +101,13 @@ describe("strings", () => {
     expect(strings.bundleImportedNoKey(3)).toContain("3");
   });
 
-  it("summarizes multi-line tunnels and fallbacks", () => {
-    expect(strings.endpointCount(2)).toBe("2 条线路");
-    expect(strings.endpointCountSuffix(3)).toContain("3");
-    expect(strings.endpointCount(4)).toContain("4");
-    expect(strings.tunnelEndpointCount(2)).toBe("2 条线路");
-    expect(strings.endpointInUse("frp 外网")).toContain("frp 外网");
-    expect(strings.endpointFallbackUsed("frp 外网")).toContain("frp 外网");
-    expect(strings.endpointDialableHint(1, 2)).toContain("1");
-    expect(strings.endpointFailureLine("家庭局域网", "连接超时")).toContain(
-      "连接超时",
-    );
-    expect(strings.endpointPreferredOn("家庭局域网")).toContain("家庭局域网");
-    expect(strings.endpointDefaultLabel(2)).toBe("线路 2");
-    expect(strings.tunnelTestOkVia("外网", 120)).toContain("外网");
+  it("summarizes multi-tunnel apps and fallbacks", () => {
+    expect(strings.appTunnelCount(2)).toContain("2");
+    expect(strings.tunnelInUse("外网入口")).toContain("外网入口");
+    expect(strings.appEditorFallbackUsed("外网入口")).toContain("外网入口");
+    expect(strings.tunnelFailureLine("家里", "连接超时")).toContain("连接超时");
+    expect(strings.appEditorTunnelOrderHint("外网  →  家里")).toContain("家里");
+    expect(strings.tunnelTestOk(120)).toContain("120");
   });
 
   it("describes ~/.ssh config import states", () => {

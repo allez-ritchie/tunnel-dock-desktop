@@ -2,23 +2,24 @@ import { describe, expect, it } from "vitest";
 import type {
   AppStatus,
   AppView,
-  EndpointView,
   GroupView,
   TunnelView,
 } from "../src/api";
 import {
+  activeTunnel,
+  appHasKnownTunnel,
+  appTunnels,
   appUnavailable,
-  preferredEndpoint,
+  primaryTunnel,
   resolveAppStatus,
   tunnelHasDialableEndpoint,
   usedFallback,
 } from "../src/status";
 
-function endpoint(overrides: Partial<EndpointView> = {}): EndpointView {
+function tunnel(overrides: Partial<TunnelView> = {}): TunnelView {
   return {
-    id: "e1",
-    label: "外网",
-    displayName: "外网",
+    id: "t1",
+    name: "外网",
     host: "example.com",
     port: 22,
     username: "ops",
@@ -29,30 +30,15 @@ function endpoint(overrides: Partial<EndpointView> = {}): EndpointView {
       hasPassphrase: false,
     },
     jumps: [],
-    wifiOnly: false,
-    enabled: true,
-    endpoint: "ops@example.com:22",
-    chainSummary: "example.com",
-    dialable: true,
-    ...overrides,
-  };
-}
-
-function tunnel(overrides: Partial<TunnelView> = {}): TunnelView {
-  return {
-    id: "t1",
-    name: "NAS",
-    endpoints: [endpoint()],
     autoReconnect: true,
     keepAliveSeconds: 30,
     connectTimeoutSeconds: 15,
     strictHostKey: true,
-    preferredEndpointId: "e1",
     createdAt: 1,
     updatedAt: 1,
     endpoint: "ops@example.com:22",
     chainSummary: "example.com",
-    dialableCount: 1,
+    dialable: true,
     ...overrides,
   };
 }
@@ -62,7 +48,7 @@ function app(overrides: Partial<AppView> = {}): AppView {
     id: "a1",
     name: "Web",
     groupId: "default",
-    tunnelId: "t1",
+    tunnelIds: ["t1"],
     localPort: 18321,
     remoteHost: "127.0.0.1",
     remotePort: 9191,
@@ -99,19 +85,22 @@ function status(overrides: Partial<AppStatus> = {}): AppStatus {
     errorCode: null,
     errorDetail: null,
     securityAlert: false,
-    endpoint: null,
-    endpointFailures: [],
+    tunnel: null,
+    tunnelFailures: [],
     updatedAt: 1,
     ...overrides,
   };
 }
 
+const home = tunnel({ id: "home", name: "家里", host: "192.168.1.10" });
+const away = tunnel({ id: "away", name: "外网", host: "frp.example.com" });
+
 describe("resolveAppStatus", () => {
   it("derives a connecting placeholder for a brand-new desired app", () => {
     const resolved = resolveAppStatus(app(), [tunnel()], [group()], {});
     expect(resolved.phase).toBe("connecting");
-    expect(resolved.endpointFailures).toEqual([]);
-    expect(resolved.endpoint).toBeNull();
+    expect(resolved.tunnelFailures).toEqual([]);
+    expect(resolved.tunnel).toBeNull();
   });
 
   it("shows idle when the app is not desired", () => {
@@ -120,10 +109,20 @@ describe("resolveAppStatus", () => {
     ).toBe("idle");
   });
 
-  it("reports a deleted tunnel even before an event arrives", () => {
+  it("reports deleted tunnels even before an event arrives", () => {
     const resolved = resolveAppStatus(app(), [], [group()], {});
     expect(resolved.blockReason).toBe("tunnel_deleted");
     expect(resolved.phase).toBe("error");
+  });
+
+  it("does not block an app that still has one surviving tunnel", () => {
+    const resolved = resolveAppStatus(
+      app({ tunnelIds: ["gone", "away"] }),
+      [away],
+      [group()],
+      {},
+    );
+    expect(resolved.blockReason).toBe("none");
   });
 
   it("reports a missing group", () => {
@@ -139,12 +138,63 @@ describe("resolveAppStatus", () => {
     ).toBe(blocked);
   });
 
-  it("passes the live endpoint information through", () => {
+  it("passes the live tunnel information through", () => {
     const live = status({
-      endpoint: { endpointId: "e2", label: "frp 外网", endpoint: "ops@frp:22" },
+      tunnel: { tunnelId: "away", name: "外网", endpoint: "ops@frp:22" },
     });
     const resolved = resolveAppStatus(app(), [tunnel()], [group()], { a1: live });
-    expect(resolved.endpoint?.label).toBe("frp 外网");
+    expect(resolved.tunnel?.name).toBe("外网");
+  });
+});
+
+describe("appHasKnownTunnel", () => {
+  it("needs at least one surviving tunnel", () => {
+    expect(appHasKnownTunnel({ tunnelIds: ["home"] }, [home])).toBe(true);
+    expect(appHasKnownTunnel({ tunnelIds: ["gone"] }, [home])).toBe(false);
+    expect(appHasKnownTunnel({ tunnelIds: [] }, [home])).toBe(false);
+  });
+});
+
+describe("appTunnels", () => {
+  const tunnels = [home, away];
+
+  it("keeps the declared order", () => {
+    expect(appTunnels({ tunnelIds: ["away", "home"] }, tunnels).map((t) => t.id)).toEqual([
+      "away",
+      "home",
+    ]);
+  });
+
+  it("skips references that no longer resolve", () => {
+    expect(appTunnels({ tunnelIds: ["gone", "away"] }, tunnels).map((t) => t.id)).toEqual([
+      "away",
+    ]);
+  });
+
+  it("exposes the primary tunnel as the first declared one", () => {
+    expect(primaryTunnel({ tunnelIds: ["away", "home"] }, tunnels)?.id).toBe("away");
+    expect(primaryTunnel({ tunnelIds: [] }, tunnels)).toBeUndefined();
+  });
+});
+
+describe("activeTunnel", () => {
+  const tunnels = [home, away];
+
+  it("prefers the tunnel reported by the live status", () => {
+    const live = status({
+      tunnel: { tunnelId: "away", name: "外网", endpoint: "ops@frp:22" },
+    });
+    expect(activeTunnel({ tunnelIds: ["home", "away"] }, tunnels, live)?.id).toBe(
+      "away",
+    );
+  });
+
+  it("falls back to the first declared tunnel before the status arrives", () => {
+    expect(activeTunnel({ tunnelIds: ["home", "away"] }, tunnels)?.id).toBe("home");
+  });
+
+  it("is undefined when every tunnel is gone", () => {
+    expect(activeTunnel({ tunnelIds: ["gone"] }, tunnels)).toBeUndefined();
   });
 });
 
@@ -171,99 +221,51 @@ describe("tunnelHasDialableEndpoint", () => {
     expect(tunnelHasDialableEndpoint(undefined)).toBe(false);
   });
 
-  it("is true when any line is dialable", () => {
-    expect(
-      tunnelHasDialableEndpoint(
-        tunnel({
-          endpoints: [
-            endpoint({ id: "off", dialable: false, enabled: false }),
-            endpoint({ id: "ok" }),
-          ],
-        }),
-      ),
-    ).toBe(true);
-  });
-
-  it("is false when no line can be dialed", () => {
-    expect(
-      tunnelHasDialableEndpoint(tunnel({ endpoints: [endpoint({ dialable: false })] })),
-    ).toBe(false);
-    expect(tunnelHasDialableEndpoint(tunnel({ endpoints: [] }))).toBe(false);
+  it("follows the backend dialable flag", () => {
+    expect(tunnelHasDialableEndpoint(tunnel({ dialable: true }))).toBe(true);
+    expect(tunnelHasDialableEndpoint(tunnel({ dialable: false }))).toBe(false);
   });
 });
 
 describe("usedFallback", () => {
-  const twoLines = tunnel({
-    endpoints: [endpoint({ id: "home" }), endpoint({ id: "away" })],
-    preferredEndpointId: "home",
-  });
+  const appTwoTunnels = { tunnelIds: ["home", "away"] };
 
   it("is false without failures", () => {
-    expect(usedFallback(status(), twoLines)).toBe(false);
+    expect(usedFallback(status(), appTwoTunnels)).toBe(false);
   });
 
-  it("is false when the preferred line is in use", () => {
+  it("is false when the preferred tunnel is in use", () => {
     const live = status({
-      endpoint: { endpointId: "home", label: "家庭", endpoint: "a" },
-      endpointFailures: [{ endpointId: "other", label: "x", code: "timeout", detail: null }],
-    });
-    expect(usedFallback(live, twoLines)).toBe(false);
-  });
-
-  it("is true when a fallback line carries the traffic", () => {
-    const live = status({
-      endpoint: { endpointId: "away", label: "frp 外网", endpoint: "b" },
-      endpointFailures: [
-        { endpointId: "home", label: "家庭", code: "timeout", detail: null },
+      tunnel: { tunnelId: "home", name: "家里", endpoint: "a" },
+      tunnelFailures: [
+        { tunnelId: "other", name: "x", code: "timeout", detail: null },
       ],
     });
-    expect(usedFallback(live, twoLines)).toBe(true);
+    expect(usedFallback(live, appTwoTunnels)).toBe(false);
+  });
+
+  it("is true when a fallback tunnel carries the traffic", () => {
+    const live = status({
+      tunnel: { tunnelId: "away", name: "外网", endpoint: "b" },
+      tunnelFailures: [{ tunnelId: "home", name: "家里", code: "timeout", detail: null }],
+    });
+    expect(usedFallback(live, appTwoTunnels)).toBe(true);
   });
 
   it("is false before the connection is up", () => {
     const reconnecting = status({
       phase: "reconnecting",
-      endpoint: { endpointId: "away", label: "frp 外网", endpoint: "b" },
-      endpointFailures: [
-        { endpointId: "home", label: "家庭", code: "timeout", detail: null },
-      ],
+      tunnel: { tunnelId: "away", name: "外网", endpoint: "b" },
+      tunnelFailures: [{ tunnelId: "home", name: "家里", code: "timeout", detail: null }],
     });
-    expect(usedFallback(reconnecting, twoLines)).toBe(false);
+    expect(usedFallback(reconnecting, appTwoTunnels)).toBe(false);
   });
 
-  it("is false when the user pinned nothing (pure auto order)", () => {
-    const auto = tunnel({
-      endpoints: [endpoint({ id: "home" }), endpoint({ id: "away" })],
-      preferredEndpointId: null,
-    });
+  it("is false for a single-tunnel app (nothing to fall back to)", () => {
     const live = status({
-      endpoint: { endpointId: "away", label: "frp 外网", endpoint: "b" },
-      endpointFailures: [
-        { endpointId: "home", label: "家庭", code: "timeout", detail: null },
-      ],
+      tunnel: { tunnelId: "other", name: "别的", endpoint: "b" },
+      tunnelFailures: [{ tunnelId: "home", name: "家里", code: "timeout", detail: null }],
     });
-    expect(usedFallback(live, auto)).toBe(false);
-  });
-});
-
-describe("preferredEndpoint", () => {
-  it("returns the pinned line", () => {
-    const tunnelView = tunnel({
-      endpoints: [endpoint({ id: "home" }), endpoint({ id: "away" })],
-      preferredEndpointId: "away",
-    });
-    expect(preferredEndpoint(tunnelView)?.id).toBe("away");
-  });
-
-  it("falls back to the first line when the pin is stale", () => {
-    const tunnelView = tunnel({
-      endpoints: [endpoint({ id: "home" })],
-      preferredEndpointId: "gone",
-    });
-    expect(preferredEndpoint(tunnelView)?.id).toBe("home");
-  });
-
-  it("is undefined without a tunnel", () => {
-    expect(preferredEndpoint(undefined)).toBeUndefined();
+    expect(usedFallback(live, { tunnelIds: ["home"] })).toBe(false);
   });
 });

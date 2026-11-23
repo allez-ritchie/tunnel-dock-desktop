@@ -1,10 +1,11 @@
 import type { AppStatus, AppView, GroupView, TunnelView } from "../api";
 import { Chip, Icon, MonoAddress } from "../components/ui";
+import { activeTunnel, appTunnels, primaryTunnel } from "../status";
 import { describeError, strings } from "../strings";
 
 interface Props {
   app: AppView | undefined;
-  tunnel: TunnelView | undefined;
+  tunnels: TunnelView[];
   group: GroupView | undefined;
   status: AppStatus | undefined;
   onBack: () => void;
@@ -14,7 +15,7 @@ interface Props {
 
 export function ErrorDetailScreen({
   app,
-  tunnel,
+  tunnels,
   group,
   status,
   onBack,
@@ -55,8 +56,11 @@ export function ErrorDetailScreen({
     status.errorCode,
     status.errorDetail,
     app.localPort,
-    tunnel?.name,
   );
+  // 应用可能持有多个入口：先说清“试过哪几条、现在用的是哪一条”。
+  const route = activeTunnel(app, tunnels, status);
+  const declared = appTunnels(app, tunnels);
+  const preferred = primaryTunnel(app, tunnels);
   const occurredAt = status.updatedAt
     ? new Date(status.updatedAt).toLocaleString()
     : "—";
@@ -113,29 +117,25 @@ export function ErrorDetailScreen({
           />
           <Fact
             label={strings.errorDetailTunnel}
-            value={tunnel ? tunnel.name : strings.errorDetailTunnelMissing}
+            value={
+              declared.length > 0
+                ? declared.map((item) => item.name).join("  →  ")
+                : strings.errorDetailTunnelMissing
+            }
             wide
           />
-          {status.endpoint ? (
-            <Fact
-              label={strings.endpointSection}
-              value={`${status.endpoint.label} · ${status.endpoint.endpoint}`}
-              mono
-              wide
-            />
-          ) : null}
-          {tunnel ? (
+          {preferred ? (
             <Fact
               label={strings.tunnelCardEndpoint}
-              value={tunnel.endpoint}
+              value={preferred.endpoint}
               mono
               wide
             />
           ) : null}
-          {tunnel ? (
+          {route ? (
             <Fact
               label={strings.tunnelCardChain}
-              value={tunnel.chainSummary}
+              value={route.chainSummary}
               mono
               wide
             />
@@ -148,21 +148,16 @@ export function ErrorDetailScreen({
           />
         </section>
 
-        {/* 多入口时逐条说明每条线路的结果，“哪条路不通”才是排障的关键。 */}
-        {status.endpointFailures.length > 0 ? (
+        {/* 多入口时逐条说明每条隧道的结果，“哪条路不通”才是排障的关键。 */}
+        {status.tunnelFailures.length > 0 ? (
           <section className="error-technical">
-            <h3>{strings.endpointFailuresTitle}</h3>
+            <h3>{strings.tunnelFailuresTitle}</h3>
             <ul className="error-failure-list">
-              {status.endpointFailures.map((failure) => (
-                <li key={failure.endpointId}>
-                  <strong>{failure.label}</strong>
+              {status.tunnelFailures.map((failure) => (
+                <li key={failure.tunnelId}>
+                  <strong>{failure.name}</strong>
                   <span>
-                    {describeError(
-                      failure.code,
-                      failure.detail,
-                      app.localPort,
-                      tunnel?.name,
-                    )}
+                    {describeError(failure.code, failure.detail, app.localPort)}
                   </span>
                 </li>
               ))}
@@ -191,7 +186,7 @@ export function ErrorDetailScreen({
             type="button"
             className="btn primary"
             onClick={onRetry}
-            disabled={!tunnel}
+            disabled={declared.length === 0}
           >
             <Icon name="refresh" size={16} />
             {strings.errorDetailRetry}

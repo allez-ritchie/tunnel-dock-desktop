@@ -7,42 +7,46 @@
 //!   同样能还原引用关系；
 //! - 不含运行状态（`desired_on`），导入后不会自动启动任何转发。
 //!
-//! 清单版本 2 起，一条隧道携带**一组线路**（`endpoints`）；版本 1 的清单仍可导入，
-//! 它把隧道上的那对 SSH 信息当作唯一的一条线路。
+//! 清单版本 3 起，隧道就是一次确定的 SSH 接入（`host`/`port`/`username`），
+//! 应用按顺序引用多条隧道（`tunnels`）。版本 1 / 2 的清单仍可导入：
+//! v1 的隧道是扁平结构；v2 的隧道持有 `endpoints`，会被拆成多条隧道并把顺序
+//! 写进应用的 `tunnels`，与本地 v3→v4 迁移保持一致。
 //!
 //! 压缩包内只有一个 `tunneldock-export.json` 清单和一个说明文件。清单是纯文本 JSON，
 //! 出现问题时可以直接用文本编辑器检查。
 
 use crate::model::{
     new_id, now_millis, AppGroup, AuthType, DockSnapshot, ForwardApp, JumpHost, SshCredentials,
-    TunnelConfig, TunnelEndpoint, DEFAULT_GROUP_ID, DEFAULT_SSH_PORT,
+    TunnelConfig, DEFAULT_GROUP_ID, DEFAULT_SSH_PORT,
 };
 use crate::secrets::Secrets;
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
-/// 当前清单版本。1 是单线路的扁平结构，2 起隧道持有 `endpoints` 数组。
-pub const EXPORT_VERSION: u32 = 2;
+/// 当前清单版本。1 是单线路的扁平结构，2 起隧道持有 `endpoints` 数组，
+/// 3 起隧道是单次接入、隧道列表归应用。
+pub const EXPORT_VERSION: u32 = 3;
 pub const EXPORT_KIND: &str = "tunneldock.export";
 pub const MANIFEST_NAME: &str = "tunneldock-export.json";
 pub const README_NAME: &str = "README.txt";
 /// 清单解压后的上限：配置包本就很小，超出即视为异常文件。
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
-/// 单条隧道最多导出多少条线路，防止异常清单撑爆内存。
-const MAX_ENDPOINTS: usize = 32;
+/// 一个应用最多引用多少条隧道，防止异常清单撑爆内存。
+const MAX_APP_TUNNELS: usize = 8;
 
 const README: &str = "\
 TunnelDock 配置包
 =================
 
 - tunneldock-export.json：应用组、应用、隧道的可移植清单（纯文本 JSON）。
-- 隧道可以有多条 SSH 线路；每条线路的凭据单独保存。
-- 凭据仅支持私钥；使用密码认证的线路不会被导出。
+- 一条隧道就是一次确定的 SSH 接入（用户名 / 地址 / 端口 / 跳板）。
+- 应用按顺序引用多条隧道，启动时依次尝试，本地端口保持不变。
+- 凭据仅支持私钥；使用密码认证的隧道不会被导出。
 - 包内不包含运行状态，导入后不会自动启动转发。
 - 该文件包含明文私钥，请按密钥文件的等级妥善保管，不要上传到公开位置。
 ";
@@ -60,11 +64,11 @@ pub struct ExportJump {
     pub passphrase: Option<String>,
 }
 
-/// 导出清单里的一条 SSH 线路。
+/// 导出清单里的一条隧道：一次确定的 SSH 接入。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
-pub struct ExportEndpoint {
-    pub label: String,
+pub struct ExportTunnel {
+    pub name: String,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -73,31 +77,6 @@ pub struct ExportEndpoint {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub passphrase: Option<String>,
     pub jumps: Vec<ExportJump>,
-    /// 只在局域网可用（家里的服务器）。
-    pub wifi_only: bool,
-    pub enabled: bool,
-}
-
-impl ExportEndpoint {
-    fn endpoint_key(&self) -> String {
-        format!(
-            "{}|{}|{}",
-            self.host.trim().to_ascii_lowercase(),
-            self.port,
-            self.username.trim()
-        )
-    }
-}
-
-/// 导出清单里的一条隧道：名称 + 一组线路 + 连接参数。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ExportTunnel {
-    pub name: String,
-    pub endpoints: Vec<ExportEndpoint>,
-    /// 首选线路的序号（导出时把首选线路排到第一位，因此这里通常只是 0）。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preferred_endpoint: Option<usize>,
     pub auto_reconnect: bool,
     pub keep_alive_seconds: u32,
     pub connect_timeout_seconds: u32,
@@ -105,21 +84,109 @@ pub struct ExportTunnel {
 }
 
 impl ExportTunnel {
-    fn has_invalid_port(&self) -> bool {
-        self.endpoints.iter().any(|endpoint| endpoint.port == 0)
+    fn has_valid_access(&self) -> bool {
+        !self.host.trim().is_empty() && !self.username.trim().is_empty()
     }
 
-    /// 丢掉缺地址 / 缺用户的线路；一条都不剩时整条隧道被跳过。
-    fn normalize(&mut self) {
-        self.endpoints.retain(|endpoint| {
-            !endpoint.host.trim().is_empty() && !endpoint.username.trim().is_empty()
-        });
-        self.endpoints.truncate(MAX_ENDPOINTS);
-        if let Some(index) = self.preferred_endpoint {
-            if index >= self.endpoints.len() {
-                self.preferred_endpoint = None;
-            }
+    /// 识别一次接入的稳定键：`host|port|user`（主机名不区分大小写）。
+    fn access_key(&self) -> String {
+        access_key(&self.host, self.port, &self.username)
+    }
+}
+
+fn access_key(host: &str, port: u16, username: &str) -> String {
+    format!(
+        "{}|{}|{}",
+        host.trim().to_ascii_lowercase(),
+        port,
+        username.trim()
+    )
+}
+
+/// 清单版本 2 的隧道：名称 + 一组线路。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+struct ExportTunnelV2 {
+    name: String,
+    endpoints: Vec<ExportEndpointV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_endpoint: Option<usize>,
+    auto_reconnect: bool,
+    keep_alive_seconds: u32,
+    connect_timeout_seconds: u32,
+    strict_host_key: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+struct ExportEndpointV2 {
+    label: String,
+    host: String,
+    port: u16,
+    username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passphrase: Option<String>,
+    jumps: Vec<ExportJump>,
+    wifi_only: bool,
+    enabled: bool,
+}
+
+impl ExportTunnelV2 {
+    /// 拆成多条 v3 隧道，返回按顺序排列的隧道名（与本地 v3→v4 迁移一致：
+    /// 首选线路在前，其余按声明顺序；停用的线路保留但应用不引用）。
+    fn into_tunnels(self) -> (Vec<ExportTunnel>, Vec<String>) {
+        if self.endpoints.is_empty() {
+            return (
+                vec![ExportTunnel {
+                    name: display_name(self.name.trim(), "", ""),
+                    auto_reconnect: self.auto_reconnect,
+                    keep_alive_seconds: self.keep_alive_seconds,
+                    connect_timeout_seconds: self.connect_timeout_seconds,
+                    strict_host_key: self.strict_host_key,
+                    ..ExportTunnel::default()
+                }],
+                Vec::new(),
+            );
         }
+        let preferred = self
+            .preferred_endpoint
+            .filter(|index| *index < self.endpoints.len());
+        let mut ordered: Vec<usize> = Vec::with_capacity(self.endpoints.len());
+        if let Some(index) = preferred {
+            ordered.push(index);
+        }
+        ordered.extend((0..self.endpoints.len()).filter(|index| Some(*index) != preferred));
+
+        let mut tunnels = Vec::with_capacity(ordered.len());
+        let mut names: Vec<String> = Vec::with_capacity(ordered.len());
+        let mut referenced: Vec<String> = Vec::new();
+        for index in ordered {
+            let endpoint = &self.endpoints[index];
+            let name = split_name(&self.name, &endpoint.label, &endpoint.host);
+            names.push(name.clone());
+            if endpoint.enabled || preferred == Some(index) {
+                referenced.push(name.clone());
+            }
+            tunnels.push(ExportTunnel {
+                name,
+                host: endpoint.host.clone(),
+                port: endpoint.port,
+                username: endpoint.username.clone(),
+                private_key: endpoint.private_key.clone(),
+                passphrase: endpoint.passphrase.clone(),
+                jumps: endpoint.jumps.clone(),
+                auto_reconnect: self.auto_reconnect,
+                keep_alive_seconds: self.keep_alive_seconds,
+                connect_timeout_seconds: self.connect_timeout_seconds,
+                strict_host_key: self.strict_host_key,
+            });
+        }
+        if referenced.is_empty() {
+            referenced = names;
+        }
+        (tunnels, referenced)
     }
 }
 
@@ -145,25 +212,33 @@ struct ExportTunnelV1 {
 impl ExportTunnelV1 {
     fn into_tunnel(self) -> ExportTunnel {
         ExportTunnel {
-            name: self.name.clone(),
-            endpoints: vec![ExportEndpoint {
-                label: self.name,
-                host: self.ssh_host,
-                port: self.ssh_port,
-                username: self.ssh_user,
-                private_key: self.private_key,
-                passphrase: self.passphrase,
-                jumps: self.jumps,
-                wifi_only: false,
-                enabled: true,
-            }],
-            preferred_endpoint: None,
+            name: display_name(self.name.trim(), &self.ssh_user, &self.ssh_host),
+            host: self.ssh_host,
+            port: self.ssh_port,
+            username: self.ssh_user,
+            private_key: self.private_key,
+            passphrase: self.passphrase,
+            jumps: self.jumps,
             auto_reconnect: self.auto_reconnect,
             keep_alive_seconds: self.keep_alive_seconds,
             connect_timeout_seconds: self.connect_timeout_seconds,
             strict_host_key: self.strict_host_key,
         }
     }
+}
+
+/// 清单版本 1 的应用：引用单条隧道。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+struct ExportAppV1 {
+    name: String,
+    group: String,
+    tunnel: String,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+    browser_url: String,
+    auto_start_on_boot: bool,
 }
 
 /// 清单版本 1 的文档布局（隧道为扁平结构）。
@@ -175,7 +250,19 @@ struct ExportDocumentV1 {
     exported_at: u64,
     tunnels: Vec<ExportTunnelV1>,
     groups: Vec<ExportGroup>,
-    apps: Vec<ExportApp>,
+    apps: Vec<ExportAppV1>,
+}
+
+/// 清单版本 2 的文档布局（隧道持有线路，应用引用单条隧道）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+struct ExportDocumentV2 {
+    version: u32,
+    kind: String,
+    exported_at: u64,
+    tunnels: Vec<ExportTunnelV2>,
+    groups: Vec<ExportGroup>,
+    apps: Vec<ExportAppV1>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,14 +271,15 @@ pub struct ExportGroup {
     pub name: String,
 }
 
+/// 导出清单里的一个应用：按顺序引用多条隧道名。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ExportApp {
     pub name: String,
     /// 引用应用组的名称（`default` 表示默认组）。
     pub group: String,
-    /// 引用隧道的名称。
-    pub tunnel: String,
+    /// 按尝试顺序排列的隧道名，第一条是首选。
+    pub tunnels: Vec<String>,
     pub local_port: u16,
     pub remote_host: String,
     pub remote_port: u16,
@@ -344,15 +432,15 @@ impl ExportPayload {
     }
 }
 
-/// 把当前配置整理成可导出清单。密码认证的线路只导出定义、不导出密码，
+/// 把当前配置整理成可导出清单。密码认证的隧道只导出定义、不导出密码，
 /// 并在 [`ExportPayload`] 里列出名字，由界面提示“导入后需要重新填写”。
 pub fn build_document(snapshot: &DockSnapshot, secrets: &Secrets) -> Result<ExportPayload, String> {
-    let group_names: std::collections::HashMap<&str, &str> = snapshot
+    let group_names: HashMap<&str, &str> = snapshot
         .groups
         .iter()
         .map(|group| (group.id.as_str(), group.name.as_str()))
         .collect();
-    let tunnel_names: std::collections::HashMap<&str, &str> = snapshot
+    let tunnel_names: HashMap<&str, &str> = snapshot
         .tunnels
         .iter()
         .map(|tunnel| (tunnel.id.as_str(), tunnel.name.as_str()))
@@ -362,65 +450,40 @@ pub fn build_document(snapshot: &DockSnapshot, secrets: &Secrets) -> Result<Expo
     let mut password_jumps = Vec::new();
     let mut tunnels = Vec::with_capacity(snapshot.tunnels.len());
     for tunnel in &snapshot.tunnels {
-        let mut endpoints = Vec::with_capacity(tunnel.endpoints.len());
-        for endpoint in &tunnel.endpoints {
-            let label = endpoint.display_name();
-            if endpoint.credentials.auth_type == AuthType::Password {
-                password_tunnels.push(format!("{} / {}", tunnel.name, label));
-            }
-            let (private_key, passphrase) =
-                export_credentials(&endpoint.credentials, secrets, label)?;
-            let mut jumps = Vec::with_capacity(endpoint.jumps.len());
-            for jump in &endpoint.jumps {
-                let jump_label = if jump.label.is_empty() {
-                    jump.host.as_str()
-                } else {
-                    jump.label.as_str()
-                };
-                if jump.credentials.auth_type == AuthType::Password {
-                    password_jumps.push(format!("{} / {} / {}", tunnel.name, label, jump_label));
-                }
-                let (jump_key, jump_passphrase) =
-                    export_credentials(&jump.credentials, secrets, jump_label)?;
-                jumps.push(ExportJump {
-                    label: jump.label.clone(),
-                    host: jump.host.clone(),
-                    port: jump.port,
-                    username: jump.username.clone(),
-                    private_key: jump_key,
-                    passphrase: jump_passphrase,
-                });
-            }
-            endpoints.push(ExportEndpoint {
-                label: endpoint.label.clone(),
-                host: endpoint.host.clone(),
-                port: endpoint.port,
-                username: endpoint.username.clone(),
-                private_key,
-                passphrase,
-                jumps,
-                wifi_only: endpoint.wifi_only,
-                enabled: endpoint.enabled,
-            });
+        if tunnel.credentials.auth_type == AuthType::Password {
+            password_tunnels.push(tunnel.name.clone());
         }
-        // 把首选线路移到第一位：导入端只需按顺序尝试，不必再存一个可变的下标。
-        let mut preferred_endpoint = None;
-        if let Some(preferred) = tunnel.preferred_endpoint_id.as_deref() {
-            if let Some(index) = tunnel
-                .endpoints
-                .iter()
-                .position(|endpoint| endpoint.id == preferred)
-            {
-                if index > 0 {
-                    endpoints.swap(0, index);
-                }
-                preferred_endpoint = Some(0);
+        let (private_key, passphrase) =
+            export_credentials(&tunnel.credentials, secrets, &tunnel.name)?;
+        let mut jumps = Vec::with_capacity(tunnel.jumps.len());
+        for jump in &tunnel.jumps {
+            let jump_label = if jump.label.is_empty() {
+                jump.host.as_str()
+            } else {
+                jump.label.as_str()
+            };
+            if jump.credentials.auth_type == AuthType::Password {
+                password_jumps.push(format!("{} / {}", tunnel.name, jump_label));
             }
+            let (jump_key, jump_passphrase) =
+                export_credentials(&jump.credentials, secrets, jump_label)?;
+            jumps.push(ExportJump {
+                label: jump.label.clone(),
+                host: jump.host.clone(),
+                port: jump.port,
+                username: jump.username.clone(),
+                private_key: jump_key,
+                passphrase: jump_passphrase,
+            });
         }
         tunnels.push(ExportTunnel {
             name: tunnel.name.clone(),
-            endpoints,
-            preferred_endpoint,
+            host: tunnel.host.clone(),
+            port: tunnel.port,
+            username: tunnel.username.clone(),
+            private_key,
+            passphrase,
+            jumps,
             auto_reconnect: tunnel.auto_reconnect,
             keep_alive_seconds: tunnel.keep_alive_seconds,
             connect_timeout_seconds: tunnel.connect_timeout_seconds,
@@ -439,9 +502,15 @@ pub fn build_document(snapshot: &DockSnapshot, secrets: &Secrets) -> Result<Expo
 
     let mut apps = Vec::with_capacity(snapshot.apps.len());
     for app in &snapshot.apps {
-        let Some(tunnel_name) = tunnel_names.get(app.tunnel_id.as_str()) else {
+        // 引用不到隧道的应用导出后也没法还原，直接跳过。
+        let tunnel_names_ordered: Vec<String> = app
+            .tunnel_ids
+            .iter()
+            .filter_map(|id| tunnel_names.get(id.as_str()).map(|name| name.to_string()))
+            .collect();
+        if tunnel_names_ordered.is_empty() {
             continue;
-        };
+        }
         let group_name = group_names
             .get(app.group_id.as_str())
             .copied()
@@ -449,7 +518,7 @@ pub fn build_document(snapshot: &DockSnapshot, secrets: &Secrets) -> Result<Expo
         apps.push(ExportApp {
             name: app.name.clone(),
             group: group_name.to_string(),
-            tunnel: tunnel_name.to_string(),
+            tunnels: tunnel_names_ordered,
             local_port: app.local_port,
             remote_host: app.remote_host.clone(),
             remote_port: app.remote_port,
@@ -481,7 +550,7 @@ pub fn preview(document: &ExportDocument) -> BundlePreview {
         tunnel_names: document
             .tunnels
             .iter()
-            .map(|tunnel| display_tunnel_name(&tunnel.name, tunnel))
+            .map(|tunnel| display_name(&tunnel.name, &tunnel.username, &tunnel.host))
             .collect(),
         group_names: document
             .groups
@@ -492,12 +561,7 @@ pub fn preview(document: &ExportDocument) -> BundlePreview {
         tunnels_without_key: document
             .tunnels
             .iter()
-            .filter(|tunnel| {
-                tunnel
-                    .endpoints
-                    .iter()
-                    .all(|endpoint| endpoint.private_key.is_none())
-            })
+            .filter(|tunnel| tunnel.private_key.is_none())
             .count(),
     }
 }
@@ -562,8 +626,8 @@ pub fn read_zip(path: &Path) -> Result<ExportDocument, String> {
 }
 
 fn decode_document(text: &str) -> Result<ExportDocument, String> {
-    // 先看 `kind` / `version`：v1 清单的隧道是扁平结构，用当前 schema 解码会
-    // 得到“有名字、没有线路”的空隧道，因此必须先按版本走对应的布局。
+    // 先看 `kind` / `version`：旧版清单的隧道布局不同，用当前 schema 解码会
+    // 得到“有名字、没有接入信息”的空隧道，因此必须先按版本走对应的布局。
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|error| format!("配置清单格式不正确: {error}"))?;
     let kind = value
@@ -595,19 +659,77 @@ fn decode_document(text: &str) -> Result<ExportDocument, String> {
                 .map(ExportTunnelV1::into_tunnel)
                 .collect(),
             groups: legacy.groups,
-            apps: legacy.apps,
+            apps: legacy
+                .apps
+                .into_iter()
+                .map(|app| ExportApp {
+                    name: app.name,
+                    group: app.group,
+                    tunnels: vec![app.tunnel],
+                    local_port: app.local_port,
+                    remote_host: app.remote_host,
+                    remote_port: app.remote_port,
+                    browser_url: app.browser_url,
+                    auto_start_on_boot: app.auto_start_on_boot,
+                })
+                .collect(),
         });
+    }
+    if version < 3 {
+        let legacy: ExportDocumentV2 = serde_json::from_str(text)
+            .map_err(|error| format!("配置清单格式不正确: {error}"))?;
+        return Ok(upgrade_v2(legacy));
     }
     let document: ExportDocument = serde_json::from_str(text)
         .map_err(|error| format!("配置清单格式不正确: {error}"))?;
     Ok(document)
 }
 
+/// v2 清单 → v3：每条线路拆成一条隧道，应用改持隧道名列表。
+fn upgrade_v2(legacy: ExportDocumentV2) -> ExportDocument {
+    let mut tunnels = Vec::new();
+    // 旧隧道名 → 按顺序排列的新隧道名。
+    let mut order_by_old: HashMap<String, Vec<String>> = HashMap::new();
+    for old in legacy.tunnels {
+        let key = old.name.trim().to_ascii_lowercase();
+        let (split, referenced) = old.into_tunnels();
+        if !key.is_empty() {
+            order_by_old.insert(key, referenced);
+        }
+        tunnels.extend(split);
+    }
+    let apps = legacy
+        .apps
+        .into_iter()
+        .map(|app| ExportApp {
+            tunnels: order_by_old
+                .get(&app.tunnel.trim().to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| vec![app.tunnel]),
+            name: app.name,
+            group: app.group,
+            local_port: app.local_port,
+            remote_host: app.remote_host,
+            remote_port: app.remote_port,
+            browser_url: app.browser_url,
+            auto_start_on_boot: app.auto_start_on_boot,
+        })
+        .collect();
+    ExportDocument {
+        version: EXPORT_VERSION,
+        kind: EXPORT_KIND.to_string(),
+        exported_at: legacy.exported_at,
+        tunnels,
+        groups: legacy.groups,
+        apps,
+    }
+}
+
 /// 把配置包合并进当前配置：
 ///
 /// - 应用组按名称去重，`default` 组始终存在；
 /// - 隧道按 `主机 + 端口 + 用户名` 去重，已存在时复用（缺凭据时补齐）；
-/// - 应用按“同名同组”去重，引用不到隧道或应用组的应用计入 `apps_dropped`；
+/// - 应用按“同名同组”去重，隧道按名称解析成 ID，引用不到的应用计入 `apps_dropped`；
 /// - 不导入运行状态，导入后不会自动启动。
 ///
 /// 整份新配置只在最后**一次性**落盘，因此导入失败不会留下半份数据。
@@ -619,12 +741,12 @@ pub async fn apply_import(
     let mut summary = ImportSummary::default();
     let mut document = document;
     for tunnel in &mut document.tunnels {
-        tunnel.normalize();
+        tunnel.name = display_name(&tunnel.name, &tunnel.username, &tunnel.host);
     }
-    document.tunnels.retain(|tunnel| !tunnel.endpoints.is_empty());
-
+    // 缺地址 / 缺用户的隧道没法连接，直接丢掉。
+    document.tunnels.retain(ExportTunnel::has_valid_access);
     for tunnel in &document.tunnels {
-        if tunnel.has_invalid_port() {
+        if tunnel.port == 0 {
             return Err(format!("隧道“{}”的 SSH 端口不合法", tunnel.name));
         }
     }
@@ -636,8 +758,7 @@ pub async fn apply_import(
     let mut changed = false;
 
     // ------------------------------------------------------------- groups
-    let mut group_ids: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut group_ids: HashMap<String, String> = HashMap::new();
     for group in &current.groups {
         group_ids.insert(group.name.to_ascii_lowercase(), group.id.clone());
     }
@@ -664,91 +785,83 @@ pub async fn apply_import(
     }
 
     // ------------------------------------------------------------- tunnels
-    // 已有的每一条线路都会进入索引：同一条隧道在另一台机器上可能已经配置了
-    // “家里 / 外网”两条入口，导入时要按线路粒度判断是否已存在。
-    let mut tunnel_ids: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    // 已有隧道按“接入键”和“名称”双索引：同一台服务器换个名字也能复用。
+    let mut tunnel_ids: HashMap<String, String> = HashMap::new();
     for tunnel in &current.tunnels {
-        for endpoint in &tunnel.endpoints {
-            tunnel_ids
-                .entry(endpoint_index_key(&endpoint.host, endpoint.port, &endpoint.username))
-                .or_insert_with(|| tunnel.id.clone());
-        }
+        tunnel_ids
+            .entry(access_key(&tunnel.host, tunnel.port, &tunnel.username))
+            .or_insert_with(|| tunnel.id.clone());
         tunnel_ids
             .entry(tunnel_key_by_name(&tunnel.name))
             .or_insert_with(|| tunnel.id.clone());
     }
 
     for tunnel in &document.tunnels {
-        let name = display_tunnel_name(&tunnel.name, tunnel);
-        let incoming = build_endpoints(tunnel, secrets)?;
-        let existing_id = incoming
-            .iter()
-            .find_map(|endpoint| tunnel_ids.get(&endpoint.0).cloned())
-            .or_else(|| tunnel_ids.get(&tunnel_key_by_name(&tunnel.name)).cloned());
+        let name = tunnel.name.clone();
+        let key = tunnel.access_key();
+        let existing_id = tunnel_ids
+            .get(&key)
+            .cloned()
+            .or_else(|| tunnel_ids.get(&tunnel_key_by_name(&name)).cloned());
 
         if let Some(existing_id) = existing_id {
             summary.tunnels_reused += 1;
             if let Some(existing) = next.tunnels.iter_mut().find(|item| item.id == existing_id) {
-                // 只补齐“完全缺失”的东西：没有凭据的线路补上私钥、没有跳板的线路补上
-                // 跳板。已有密码 / 私钥 / 跳板的线路一律保持原样，不能因为一次导入被
+                // 只补齐“完全缺失”的东西：没有凭据的隧道补上私钥、没有跳板的补上
+                // 跳板。已有密码 / 私钥 / 跳板的一律保持原样，不能因为一次导入被
                 // 静默改掉认证方式，否则可能影响正在运行的转发。
                 let mut touched = false;
-                for (key, endpoint) in &incoming {
-                    match existing
-                        .endpoints
-                        .iter_mut()
-                        .find(|item| endpoint_index_key(&item.host, item.port, &item.username) == *key)
-                    {
-                        Some(current_endpoint) => {
-                            if !current_endpoint.credentials.has_secret()
-                                && endpoint.credentials.private_key_cipher.is_some()
-                            {
-                                current_endpoint.credentials = endpoint.credentials.clone();
-                                touched = true;
-                            }
-                            if current_endpoint.jumps.is_empty() && !endpoint.jumps.is_empty() {
-                                current_endpoint.jumps = endpoint.jumps.clone();
-                                touched = true;
-                            }
-                        }
-                        // 线上还不存在这条线路：补一条，正是“换台机器也能还原多入口”的场景。
-                        None => {
-                            existing.endpoints.push(endpoint.clone());
-                            touched = true;
-                        }
-                    }
+                if !existing.credentials.has_secret() && tunnel.private_key.is_some() {
+                    existing.credentials = import_credentials(
+                        tunnel.private_key.as_ref(),
+                        tunnel.passphrase.as_ref(),
+                        secrets,
+                    )?;
+                    touched = true;
+                }
+                if existing.jumps.is_empty() && !tunnel.jumps.is_empty() {
+                    existing.jumps = tunnel
+                        .jumps
+                        .iter()
+                        .map(|jump| build_jump(jump, secrets))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    touched = true;
                 }
                 if touched {
                     existing.updated_at = now_millis();
                     changed = true;
                 }
             }
-            tunnel_ids.insert(tunnel_key_by_name(&tunnel.name), existing_id);
+            tunnel_ids.insert(tunnel_key_by_name(&name), existing_id.clone());
+            tunnel_ids.entry(key).or_insert(existing_id);
             continue;
         }
 
-        let mut config = TunnelConfig {
+        let config = TunnelConfig {
             id: new_id(),
-            name,
-            endpoints: incoming.iter().map(|(_, endpoint)| endpoint.clone()).collect(),
-            preferred_endpoint_id: tunnel
-                .preferred_endpoint
-                .and_then(|index| incoming.get(index).map(|(_, endpoint)| endpoint.id.clone())),
+            name: name.clone(),
+            host: tunnel.host.trim().to_string(),
+            port: tunnel.port.max(1),
+            username: tunnel.username.trim().to_string(),
+            credentials: import_credentials(
+                tunnel.private_key.as_ref(),
+                tunnel.passphrase.as_ref(),
+                secrets,
+            )?,
+            jumps: tunnel
+                .jumps
+                .iter()
+                .map(|jump| build_jump(jump, secrets))
+                .collect::<Result<Vec<_>, _>>()?,
             auto_reconnect: tunnel.auto_reconnect,
-            keep_alive_seconds: tunnel.keep_alive_seconds.clamp(5, 300).max(5),
-            connect_timeout_seconds: tunnel.connect_timeout_seconds.clamp(5, 120).max(5),
+            keep_alive_seconds: tunnel.keep_alive_seconds.clamp(5, 300),
+            connect_timeout_seconds: tunnel.connect_timeout_seconds.clamp(5, 120),
             strict_host_key: tunnel.strict_host_key,
             created_at: now_millis(),
             updated_at: now_millis(),
         };
-        if config.preferred_endpoint_id.is_none() {
-            config.preferred_endpoint_id = config.endpoints.first().map(|item| item.id.clone());
-        }
-        for (key, _) in &incoming {
-            tunnel_ids.insert(key.clone(), config.id.clone());
-        }
-        tunnel_ids.insert(tunnel_key_by_name(&tunnel.name), config.id.clone());
+        tunnel_ids.insert(key, config.id.clone());
+        tunnel_ids.insert(tunnel_key_by_name(&name), config.id.clone());
         current.tunnels.push(config.clone());
         next.tunnels.push(config);
         summary.tunnels_added += 1;
@@ -768,10 +881,19 @@ pub async fn apply_import(
             summary.apps_dropped += 1;
             continue;
         }
-        let Some(tunnel_id) = tunnel_ids.get(&tunnel_key_by_name(&app.tunnel)).cloned() else {
+        // 隧道按名称解析，顺序保持清单里的顺序；解析不到的跳过。
+        let mut tunnel_ids_ordered: Vec<String> = Vec::new();
+        for tunnel_name in app.tunnels.iter().take(MAX_APP_TUNNELS) {
+            if let Some(id) = tunnel_ids.get(&tunnel_key_by_name(tunnel_name)) {
+                if !tunnel_ids_ordered.contains(id) {
+                    tunnel_ids_ordered.push(id.clone());
+                }
+            }
+        }
+        if tunnel_ids_ordered.is_empty() {
             summary.apps_dropped += 1;
             continue;
-        };
+        }
         let group_id = group_ids
             .get(&app.group.trim().to_ascii_lowercase())
             .cloned()
@@ -793,7 +915,7 @@ pub async fn apply_import(
             id: new_id(),
             name: name.to_string(),
             group_id: group_id.clone(),
-            tunnel_id,
+            tunnel_ids: tunnel_ids_ordered,
             local_port: app.local_port,
             remote_host: app.remote_host.trim().to_string(),
             remote_port: app.remote_port.max(1),
@@ -823,62 +945,8 @@ fn tunnel_key_by_name(name: &str) -> String {
     format!("name:{}", name.trim().to_ascii_lowercase())
 }
 
-/// 识别一条线路的稳定键：`host|port|user`（主机名不区分大小写）。
-fn endpoint_index_key(host: &str, port: u16, username: &str) -> String {
-    format!(
-        "{}|{}|{}",
-        host.trim().to_ascii_lowercase(),
-        port,
-        username.trim()
-    )
-}
-
-/// 把导出清单里的一条隧道转成 (线路键, 线路) 列表，凭据就地加密。
-fn build_endpoints(
-    tunnel: &ExportTunnel,
-    secrets: &Secrets,
-) -> Result<Vec<(String, TunnelEndpoint)>, String> {
-    let mut endpoints = Vec::with_capacity(tunnel.endpoints.len());
-    for endpoint in &tunnel.endpoints {
-        let jumps = endpoint
-            .jumps
-            .iter()
-            .map(|jump| build_jump(jump, secrets))
-            .collect::<Result<Vec<_>, _>>()?;
-        let key = endpoint.endpoint_key();
-        endpoints.push((
-            key,
-            TunnelEndpoint {
-                id: new_id(),
-                label: endpoint.label.trim().to_string(),
-                host: endpoint.host.trim().to_string(),
-                port: endpoint.port.max(1),
-                username: endpoint.username.trim().to_string(),
-                credentials: import_credentials(
-                    endpoint.private_key.as_ref(),
-                    endpoint.passphrase.as_ref(),
-                    secrets,
-                )?,
-                jumps,
-                wifi_only: endpoint.wifi_only,
-                enabled: endpoint.enabled,
-            },
-        ));
-    }
-    Ok(endpoints)
-}
-
-/// 隧道名缺失时用第一条线路的 `user@host` 兜底。
-fn display_tunnel_name(name: &str, tunnel: &ExportTunnel) -> String {
-    let endpoint = tunnel.endpoints.first();
-    display_name_from(
-        name,
-        endpoint.map(|item| item.username.as_str()).unwrap_or(""),
-        endpoint.map(|item| item.host.as_str()).unwrap_or(""),
-    )
-}
-
-fn display_name_from(name: &str, user: &str, host: &str) -> String {
+/// 隧道名缺失时用 `user@host` 兜底；名称超过 40 个字符时截断。
+fn display_name(name: &str, user: &str, host: &str) -> String {
     let trimmed = name.trim();
     if !trimmed.is_empty() {
         return trimmed.chars().take(40).collect();
@@ -894,6 +962,32 @@ fn display_name_from(name: &str, user: &str, host: &str) -> String {
         host.trim()
     };
     format!("{user}@{host}").chars().take(40).collect()
+}
+
+/// 拆分后的隧道名：`原名 · 线路名`，超长时截断到 40 个字符。
+fn split_name(name: &str, label: &str, host: &str) -> String {
+    let base = {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            "SSH"
+        } else {
+            trimmed
+        }
+    };
+    let suffix = {
+        let label = label.trim();
+        if !label.is_empty() {
+            label
+        } else {
+            host.trim()
+        }
+    };
+    let combined = if suffix.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} · {suffix}")
+    };
+    combined.chars().take(40).collect()
 }
 
 fn build_jump(jump: &ExportJump, secrets: &Secrets) -> Result<JumpHost, String> {
@@ -942,25 +1036,21 @@ mod tests {
     fn private_key_tunnel(vault: &Secrets, name: &str) -> TunnelConfig {
         TunnelConfig {
             name: name.into(),
-            endpoints: vec![TunnelEndpoint {
-                label: name.into(),
-                host: "example.com".into(),
-                port: 22,
+            host: "example.com".into(),
+            port: 22,
+            username: "ops".into(),
+            credentials: private_key_credentials(vault),
+            jumps: vec![JumpHost {
+                id: new_id(),
+                label: "堡垒机".into(),
+                host: "bastion.example.com".into(),
+                port: 2222,
                 username: "ops".into(),
-                credentials: private_key_credentials(vault),
-                jumps: vec![JumpHost {
-                    id: new_id(),
-                    label: "堡垒机".into(),
-                    host: "bastion.example.com".into(),
-                    port: 2222,
-                    username: "ops".into(),
-                    credentials: SshCredentials {
-                        auth_type: AuthType::PrivateKey,
-                        private_key_cipher: Some(vault.encrypt("-----BEGIN BASTION-----").unwrap()),
-                        ..SshCredentials::default()
-                    },
-                }],
-                ..TunnelEndpoint::default()
+                credentials: SshCredentials {
+                    auth_type: AuthType::PrivateKey,
+                    private_key_cipher: Some(vault.encrypt("-----BEGIN BASTION-----").unwrap()),
+                    ..SshCredentials::default()
+                },
             }],
             ..TunnelConfig::default()
         }
@@ -986,7 +1076,7 @@ mod tests {
             .upsert_app(ForwardApp {
                 name: "后台".into(),
                 group_id: group.id.clone(),
-                tunnel_id: tunnel.id.clone(),
+                tunnel_ids: vec![tunnel.id.clone()],
                 local_port: 18080,
                 remote_host: "10.0.0.5".into(),
                 remote_port: 5000,
@@ -1002,10 +1092,9 @@ mod tests {
         assert_eq!(document.groups.len(), 1, "默认组不导出");
         assert_eq!(document.apps.len(), 1);
         assert_eq!(document.apps[0].group, "工作");
-        assert_eq!(document.apps[0].tunnel, "生产");
-        assert_eq!(document.tunnels[0].endpoints.len(), 1);
+        assert_eq!(document.apps[0].tunnels, vec!["生产".to_string()]);
         assert_eq!(
-            document.tunnels[0].endpoints[0].private_key.as_deref(),
+            document.tunnels[0].private_key.as_deref(),
             Some("-----BEGIN KEY-----")
         );
 
@@ -1028,20 +1117,25 @@ mod tests {
         let imported = target_store.snapshot().await;
         assert_eq!(imported.tunnels.len(), 1);
         assert_eq!(imported.tunnels[0].name, "生产");
-        assert_eq!(imported.tunnels[0].endpoints.len(), 1);
-        let endpoint = &imported.tunnels[0].endpoints[0];
-        assert_eq!(endpoint.jumps.len(), 1);
-        assert_eq!(
-            target_vault
-                .decrypt(endpoint.credentials.private_key_cipher.as_ref().unwrap())
-                .unwrap(),
-            "-----BEGIN KEY-----"
-        );
-        assert!(endpoint.credentials.passphrase_cipher.is_some());
+        assert_eq!(imported.tunnels[0].host, "example.com");
+        assert_eq!(imported.tunnels[0].jumps.len(), 1);
         assert_eq!(
             target_vault
                 .decrypt(
-                    endpoint.jumps[0]
+                    imported.tunnels[0]
+                        .credentials
+                        .private_key_cipher
+                        .as_ref()
+                        .unwrap()
+                )
+                .unwrap(),
+            "-----BEGIN KEY-----"
+        );
+        assert!(imported.tunnels[0].credentials.passphrase_cipher.is_some());
+        assert_eq!(
+            target_vault
+                .decrypt(
+                    imported.tunnels[0].jumps[0]
                         .credentials
                         .private_key_cipher
                         .as_ref()
@@ -1052,12 +1146,17 @@ mod tests {
         );
         let imported_group = imported.groups.iter().find(|g| g.name == "工作").unwrap();
         assert_eq!(imported.apps[0].group_id, imported_group.id);
+        assert_eq!(imported.apps[0].tunnel_ids.len(), 1);
+        assert_eq!(
+            imported.tunnel(&imported.apps[0].tunnel_ids[0]).unwrap().name,
+            "生产"
+        );
         assert!(!imported.apps[0].desired_on, "导入不恢复运行状态");
         assert!(imported.apps[0].auto_start_on_boot);
     }
 
     #[tokio::test]
-    async fn import_is_idempotent_and_dedupes_by_endpoint() {
+    async fn import_is_idempotent_and_dedupes_by_access() {
         let dir = tempfile::tempdir().unwrap();
         let vault = secrets(dir.path());
         let source = Store::load(dir.path()).await.unwrap();
@@ -1089,25 +1188,21 @@ mod tests {
         store
             .upsert_tunnel(TunnelConfig {
                 name: "密码隧道".into(),
-                endpoints: vec![TunnelEndpoint {
-                    label: "外网".into(),
-                    host: "example.com".into(),
-                    username: "ops".into(),
-                    credentials: SshCredentials {
-                        auth_type: AuthType::Password,
-                        password_cipher: Some(vault.encrypt("s3cret").unwrap()),
-                        ..SshCredentials::default()
-                    },
-                    ..TunnelEndpoint::default()
-                }],
+                host: "example.com".into(),
+                username: "ops".into(),
+                credentials: SshCredentials {
+                    auth_type: AuthType::Password,
+                    password_cipher: Some(vault.encrypt("s3cret").unwrap()),
+                    ..SshCredentials::default()
+                },
                 ..TunnelConfig::default()
             })
             .await
             .unwrap();
         let payload = build_document(&store.snapshot().await, &vault).unwrap();
-        assert_eq!(payload.password_tunnels, vec!["密码隧道 / 外网".to_string()]);
+        assert_eq!(payload.password_tunnels, vec!["密码隧道".to_string()]);
         assert_eq!(payload.document.tunnels.len(), 1);
-        assert!(payload.document.tunnels[0].endpoints[0].private_key.is_none());
+        assert!(payload.document.tunnels[0].private_key.is_none());
         assert!(payload.summary("x.zip").password_tunnels.len() == 1);
     }
 
@@ -1126,14 +1221,10 @@ mod tests {
             }],
             tunnels: vec![ExportTunnel {
                 name: "坏隧道".into(),
-                endpoints: vec![ExportEndpoint {
-                    label: "坏隧道".into(),
-                    host: "example.com".into(),
-                    port: 0,
-                    username: "ops".into(),
-                    private_key: Some("-----BEGIN KEY-----".into()),
-                    ..ExportEndpoint::default()
-                }],
+                host: "example.com".into(),
+                port: 0,
+                username: "ops".into(),
+                private_key: Some("-----BEGIN KEY-----".into()),
                 ..ExportTunnel::default()
             }],
             ..ExportDocument::default()
@@ -1156,13 +1247,9 @@ mod tests {
             kind: EXPORT_KIND.into(),
             tunnels: vec![ExportTunnel {
                 name: "生产".into(),
-                endpoints: vec![ExportEndpoint {
-                    label: "生产".into(),
-                    host: "example.com".into(),
-                    port: 22,
-                    username: "ops".into(),
-                    ..ExportEndpoint::default()
-                }],
+                host: "example.com".into(),
+                port: 22,
+                username: "ops".into(),
                 ..ExportTunnel::default()
             }],
             ..ExportDocument::default()
@@ -1170,12 +1257,12 @@ mod tests {
         apply_import(document.clone(), &store, &vault)
             .await
             .unwrap();
-        assert!(store.snapshot().await.tunnels[0].endpoints[0]
+        assert!(store.snapshot().await.tunnels[0]
             .credentials
             .private_key_cipher
             .is_none());
 
-        document.tunnels[0].endpoints[0].private_key = Some("-----BEGIN KEY-----".into());
+        document.tunnels[0].private_key = Some("-----BEGIN KEY-----".into());
         let summary = apply_import(document, &store, &vault).await.unwrap();
         assert_eq!(summary.tunnels_added, 0);
         assert_eq!(summary.tunnels_reused, 1);
@@ -1184,7 +1271,7 @@ mod tests {
         assert_eq!(
             vault
                 .decrypt(
-                    snapshot.tunnels[0].endpoints[0]
+                    snapshot.tunnels[0]
                         .credentials
                         .private_key_cipher
                         .as_ref()
@@ -1205,18 +1292,14 @@ mod tests {
         store
             .upsert_tunnel(TunnelConfig {
                 name: "生产".into(),
-                endpoints: vec![TunnelEndpoint {
-                    label: "生产".into(),
-                    host: "example.com".into(),
-                    port: 22,
-                    username: "ops".into(),
-                    credentials: SshCredentials {
-                        auth_type: AuthType::Password,
-                        password_cipher: Some(password_cipher.clone()),
-                        ..SshCredentials::default()
-                    },
-                    ..TunnelEndpoint::default()
-                }],
+                host: "example.com".into(),
+                port: 22,
+                username: "ops".into(),
+                credentials: SshCredentials {
+                    auth_type: AuthType::Password,
+                    password_cipher: Some(password_cipher.clone()),
+                    ..SshCredentials::default()
+                },
                 ..TunnelConfig::default()
             })
             .await
@@ -1227,14 +1310,10 @@ mod tests {
             kind: EXPORT_KIND.into(),
             tunnels: vec![ExportTunnel {
                 name: "生产".into(),
-                endpoints: vec![ExportEndpoint {
-                    label: "生产".into(),
-                    host: "example.com".into(),
-                    port: 22,
-                    username: "ops".into(),
-                    private_key: Some("-----BEGIN KEY-----".into()),
-                    ..ExportEndpoint::default()
-                }],
+                host: "example.com".into(),
+                port: 22,
+                username: "ops".into(),
+                private_key: Some("-----BEGIN KEY-----".into()),
                 ..ExportTunnel::default()
             }],
             ..ExportDocument::default()
@@ -1244,7 +1323,7 @@ mod tests {
 
         let snapshot = store.snapshot().await;
         assert_eq!(snapshot.tunnels.len(), 1);
-        let credentials = &snapshot.tunnels[0].endpoints[0].credentials;
+        let credentials = &snapshot.tunnels[0].credentials;
         assert_eq!(credentials.auth_type, AuthType::Password);
         assert_eq!(
             credentials.password_cipher.as_deref(),
@@ -1254,47 +1333,53 @@ mod tests {
         assert!(credentials.private_key_cipher.is_none());
     }
 
-    /// 多线路隧道导出后必须原样还原，首选线路的先后顺序也要保住。
+    /// 两个入口就是两条隧道，应用按顺序引用；导出导入后顺序必须原样还原。
     #[tokio::test]
-    async fn multi_endpoint_tunnels_round_trip() {
+    async fn app_tunnel_order_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let vault = secrets(dir.path());
         let store = Store::load(dir.path()).await.unwrap();
-        let home = TunnelEndpoint {
-            label: "家庭局域网".into(),
-            host: "192.168.1.10".into(),
-            port: 22,
-            username: "ops".into(),
-            credentials: private_key_credentials(&vault),
-            wifi_only: true,
-            ..TunnelEndpoint::default()
-        };
-        let away = TunnelEndpoint {
-            label: "frp 外网".into(),
-            host: "frp.example.com".into(),
-            port: 2222,
-            username: "ops".into(),
-            credentials: private_key_credentials(&vault),
-            ..TunnelEndpoint::default()
-        };
-        // 首选是第二条：导出时应被挪到第一位，导入后仍然优先尝试它。
-        let saved = store
+        let home = store
             .upsert_tunnel(TunnelConfig {
-                name: "NAS".into(),
-                endpoints: vec![home, away.clone()],
-                preferred_endpoint_id: Some(away.id.clone()),
+                name: "家里".into(),
+                host: "192.168.1.10".into(),
+                username: "ops".into(),
+                credentials: private_key_credentials(&vault),
                 ..TunnelConfig::default()
             })
             .await
             .unwrap();
-        assert_eq!(saved.endpoints.len(), 2);
+        let away = store
+            .upsert_tunnel(TunnelConfig {
+                name: "外网".into(),
+                host: "frp.example.com".into(),
+                port: 2222,
+                username: "ops".into(),
+                credentials: private_key_credentials(&vault),
+                ..TunnelConfig::default()
+            })
+            .await
+            .unwrap();
+        // 外网优先、家里兜底。
+        store
+            .upsert_app(ForwardApp {
+                name: "NAS".into(),
+                tunnel_ids: vec![away.id.clone(), home.id.clone()],
+                local_port: 18080,
+                remote_host: "127.0.0.1".into(),
+                remote_port: 5000,
+                ..ForwardApp::default()
+            })
+            .await
+            .unwrap();
 
         let payload = build_document(&store.snapshot().await, &vault).unwrap();
         let document = payload.document;
-        assert_eq!(document.tunnels[0].endpoints.len(), 2);
-        assert_eq!(document.tunnels[0].endpoints[0].label, "frp 外网");
-        assert_eq!(document.tunnels[0].preferred_endpoint, Some(0));
-        assert!(document.tunnels[0].endpoints[0].enabled);
+        assert_eq!(document.tunnels.len(), 2, "每条隧道只描述一次接入");
+        assert_eq!(
+            document.apps[0].tunnels,
+            vec!["外网".to_string(), "家里".to_string()]
+        );
 
         let zip_path = dir.path().join("export.zip");
         write_zip(&zip_path, &document).unwrap();
@@ -1306,40 +1391,31 @@ mod tests {
         let summary = apply_import(decoded, &target_store, &target_vault)
             .await
             .unwrap();
-        assert_eq!(summary.tunnels_added, 1);
+        assert_eq!(summary.tunnels_added, 2);
+        assert_eq!(summary.apps_added, 1);
         let imported = target_store.snapshot().await;
-        let tunnel = &imported.tunnels[0];
-        assert_eq!(tunnel.endpoints.len(), 2);
-        assert_eq!(tunnel.endpoints[0].label, "frp 外网");
-        assert_eq!(tunnel.endpoints[0].port, 2222);
-        assert!(tunnel.endpoints.iter().any(|item| item.wifi_only));
-        assert_eq!(
-            tunnel.preferred_endpoint_id.as_deref(),
-            Some(tunnel.endpoints[0].id.as_str())
-        );
-        for endpoint in &tunnel.endpoints {
-            assert!(endpoint.credentials.private_key_cipher.is_some());
+        let app = &imported.apps[0];
+        assert_eq!(app.tunnel_ids.len(), 2);
+        assert_eq!(imported.tunnel(&app.tunnel_ids[0]).unwrap().name, "外网");
+        assert_eq!(imported.tunnel(&app.tunnel_ids[1]).unwrap().name, "家里");
+        for tunnel in &imported.tunnels {
+            assert!(tunnel.credentials.private_key_cipher.is_some());
         }
     }
 
-    /// 另一台机器上已有同一条隧道的“外网”线路时，导入“家里”线路应当补到
-    /// 同一条隧道里，而不是新建一条隧道——这正是多入口跨设备还原的关键。
+    /// 另一台机器上已有同一个入口时，导入不会新建第二条隧道，但应用仍能引用它。
     #[tokio::test]
-    async fn importing_a_second_line_extends_the_existing_tunnel() {
+    async fn importing_an_existing_access_reuses_the_tunnel() {
         let dir = tempfile::tempdir().unwrap();
         let vault = secrets(dir.path());
         let store = Store::load(dir.path()).await.unwrap();
-        store
+        let existing = store
             .upsert_tunnel(TunnelConfig {
-                name: "NAS".into(),
-                endpoints: vec![TunnelEndpoint {
-                    label: "frp 外网".into(),
-                    host: "frp.example.com".into(),
-                    port: 2222,
-                    username: "ops".into(),
-                    credentials: private_key_credentials(&vault),
-                    ..TunnelEndpoint::default()
-                }],
+                name: "外网".into(),
+                host: "frp.example.com".into(),
+                port: 2222,
+                username: "ops".into(),
+                credentials: private_key_credentials(&vault),
                 ..TunnelConfig::default()
             })
             .await
@@ -1348,46 +1424,51 @@ mod tests {
         let document = ExportDocument {
             version: EXPORT_VERSION,
             kind: EXPORT_KIND.into(),
-            tunnels: vec![ExportTunnel {
-                name: "NAS".into(),
-                endpoints: vec![ExportEndpoint {
-                    label: "家庭局域网".into(),
+            tunnels: vec![
+                ExportTunnel {
+                    name: "外网（改名）".into(),
+                    host: "frp.example.com".into(),
+                    port: 2222,
+                    username: "ops".into(),
+                    private_key: Some("-----BEGIN AWAY-----".into()),
+                    ..ExportTunnel::default()
+                },
+                ExportTunnel {
+                    name: "家里".into(),
                     host: "192.168.1.10".into(),
                     port: 22,
                     username: "ops".into(),
                     private_key: Some("-----BEGIN HOME-----".into()),
-                    wifi_only: true,
-                    enabled: true,
-                    ..ExportEndpoint::default()
-                }],
-                ..ExportTunnel::default()
+                    ..ExportTunnel::default()
+                },
+            ],
+            apps: vec![ExportApp {
+                name: "NAS".into(),
+                group: DEFAULT_GROUP_ID.into(),
+                tunnels: vec!["外网（改名）".into(), "家里".into()],
+                local_port: 18080,
+                remote_host: "127.0.0.1".into(),
+                remote_port: 5000,
+                ..ExportApp::default()
             }],
             ..ExportDocument::default()
         };
         let summary = apply_import(document, &store, &vault).await.unwrap();
-        assert_eq!(summary.tunnels_added, 0);
+        assert_eq!(summary.tunnels_added, 1, "同一 host/port/user 只补一条");
         assert_eq!(summary.tunnels_reused, 1);
         let snapshot = store.snapshot().await;
-        assert_eq!(snapshot.tunnels.len(), 1, "不能因为多一条线路就多一条隧道");
-        let tunnel = &snapshot.tunnels[0];
-        assert_eq!(tunnel.endpoints.len(), 2);
-        let home = tunnel
-            .endpoints
-            .iter()
-            .find(|item| item.host == "192.168.1.10")
-            .expect("家里那条线路应当被补进来");
-        assert!(home.wifi_only);
+        assert_eq!(snapshot.tunnels.len(), 2);
+        let app = &snapshot.apps[0];
+        assert_eq!(app.tunnel_ids[0], existing.id, "复用已有隧道而不是新建");
         assert_eq!(
-            vault
-                .decrypt(home.credentials.private_key_cipher.as_ref().unwrap())
-                .unwrap(),
-            "-----BEGIN HOME-----"
+            snapshot.tunnel(&app.tunnel_ids[1]).unwrap().host,
+            "192.168.1.10"
         );
     }
 
-    /// 旧版（v1）配置包里的隧道是扁平结构，必须按“唯一一条线路”导入。
+    /// 旧版（v1）配置包里的隧道是扁平结构，按“单条隧道”导入。
     #[test]
-    fn a_version_one_bundle_upgrades_to_a_single_endpoint() {
+    fn a_version_one_bundle_upgrades_to_a_flat_tunnel() {
         let text = serde_json::json!({
             "version": 1,
             "kind": EXPORT_KIND,
@@ -1404,38 +1485,110 @@ mod tests {
                 }]
             }],
             "groups": [{ "name": "工作" }],
-            "apps": []
+            "apps": [{
+                "name": "后台", "group": "工作", "tunnel": "生产",
+                "localPort": 18080, "remoteHost": "127.0.0.1", "remotePort": 80
+            }]
         })
         .to_string();
         let document = decode_document(&text).unwrap();
         assert_eq!(document.version, EXPORT_VERSION);
         assert_eq!(document.tunnels.len(), 1);
-        let endpoint = &document.tunnels[0].endpoints[0];
-        assert_eq!(endpoint.host, "example.com");
-        assert_eq!(endpoint.port, 2222);
-        assert_eq!(endpoint.username, "ops");
-        assert_eq!(endpoint.label, "生产", "v1 没有线路名，用隧道名兜底");
-        assert_eq!(endpoint.private_key.as_deref(), Some("-----BEGIN KEY-----"));
-        assert_eq!(endpoint.jumps.len(), 1);
-        assert!(endpoint.enabled);
-        assert!(!endpoint.wifi_only);
+        let tunnel = &document.tunnels[0];
+        assert_eq!(tunnel.name, "生产");
+        assert_eq!(tunnel.host, "example.com");
+        assert_eq!(tunnel.port, 2222);
+        assert_eq!(tunnel.username, "ops");
+        assert_eq!(tunnel.private_key.as_deref(), Some("-----BEGIN KEY-----"));
+        assert_eq!(tunnel.jumps.len(), 1);
         assert_eq!(document.groups.len(), 1);
+        assert_eq!(document.apps[0].tunnels, vec!["生产".to_string()]);
     }
 
-    /// 预览里的“缺私钥”按隧道统计：只要有一条线路带私钥就不算缺。
+    /// v2 配置包：一条隧道多条线路，导入时拆成多条隧道并写进应用的隧道列表。
     #[test]
-    fn preview_counts_tunnels_without_any_key() {
+    fn a_version_two_bundle_splits_lines_into_tunnels() {
+        let text = serde_json::json!({
+            "version": 2,
+            "kind": EXPORT_KIND,
+            "tunnels": [{
+                "name": "NAS",
+                "endpoints": [
+                    {
+                        "label": "家庭局域网", "host": "192.168.1.10", "port": 22,
+                        "username": "ops", "privateKey": "-----BEGIN HOME-----",
+                        "wifiOnly": true, "enabled": true
+                    },
+                    {
+                        "label": "frp 外网", "host": "frp.example.com", "port": 2222,
+                        "username": "ops", "privateKey": "-----BEGIN AWAY-----",
+                        "enabled": true
+                    }
+                ],
+                "preferredEndpoint": 1
+            }],
+            "apps": [{
+                "name": "后台", "group": "default", "tunnel": "NAS",
+                "localPort": 18080, "remoteHost": "127.0.0.1", "remotePort": 80
+            }]
+        })
+        .to_string();
+        let document = decode_document(&text).unwrap();
+        assert_eq!(document.version, EXPORT_VERSION);
+        assert_eq!(document.tunnels.len(), 2);
+        // 首选线路排在最前，其余按声明顺序。
+        assert_eq!(document.tunnels[0].name, "NAS · frp 外网");
+        assert_eq!(document.tunnels[0].host, "frp.example.com");
+        assert_eq!(document.tunnels[1].name, "NAS · 家庭局域网");
+        assert_eq!(
+            document.apps[0].tunnels,
+            vec!["NAS · frp 外网".to_string(), "NAS · 家庭局域网".to_string()]
+        );
+    }
+
+    /// v2 包里被停用的线路不进入应用的隧道列表，但隧道定义仍然保留。
+    #[test]
+    fn a_disabled_v2_line_is_kept_but_not_referenced() {
+        let text = serde_json::json!({
+            "version": 2,
+            "kind": EXPORT_KIND,
+            "tunnels": [{
+                "name": "NAS",
+                "endpoints": [
+                    {
+                        "label": "已停用", "host": "dead.example.com", "port": 22,
+                        "username": "ops", "enabled": false
+                    },
+                    {
+                        "label": "外网", "host": "frp.example.com", "port": 2222,
+                        "username": "ops", "privateKey": "k", "enabled": true
+                    }
+                ]
+            }],
+            "apps": [{
+                "name": "后台", "group": "default", "tunnel": "NAS",
+                "localPort": 18080, "remoteHost": "127.0.0.1", "remotePort": 80
+            }]
+        })
+        .to_string();
+        let document = decode_document(&text).unwrap();
+        assert_eq!(document.tunnels.len(), 2);
+        assert_eq!(
+            document.apps[0].tunnels,
+            vec!["NAS · 外网".to_string()],
+            "停用的入口不进应用的尝试顺序"
+        );
+    }
+
+    /// 预览里的“缺私钥”按隧道统计。
+    #[test]
+    fn preview_counts_tunnels_without_a_key() {
         let tunnel = |name: &str, key: Option<&str>| ExportTunnel {
             name: name.into(),
-            endpoints: vec![ExportEndpoint {
-                label: name.into(),
-                host: "example.com".into(),
-                port: 22,
-                username: "ops".into(),
-                private_key: key.map(str::to_string),
-                enabled: true,
-                ..ExportEndpoint::default()
-            }],
+            host: "example.com".into(),
+            port: 22,
+            username: "ops".into(),
+            private_key: key.map(str::to_string),
             ..ExportTunnel::default()
         };
         let preview = preview(&ExportDocument {
@@ -1447,43 +1600,60 @@ mod tests {
         assert_eq!(preview.tunnels_without_key, 1);
     }
 
-    /// 清单里缺地址 / 缺用户的线路会被丢掉，整条隧道没线路时整条跳过。
-    #[test]
-    fn lines_without_address_or_user_are_dropped() {
-        let mut tunnel = ExportTunnel {
-            name: "脏数据".into(),
-            endpoints: vec![
-                ExportEndpoint {
+    /// 缺地址 / 缺用户的隧道会被丢掉，引用它的应用计入 dropped。
+    #[tokio::test]
+    async fn tunnels_without_address_or_user_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = secrets(dir.path());
+        let store = Store::load(dir.path()).await.unwrap();
+        let document = ExportDocument {
+            version: EXPORT_VERSION,
+            kind: EXPORT_KIND.into(),
+            tunnels: vec![
+                ExportTunnel {
+                    name: "脏数据".into(),
                     host: "  ".into(),
                     username: "ops".into(),
                     port: 22,
-                    ..ExportEndpoint::default()
+                    ..ExportTunnel::default()
                 },
-                ExportEndpoint {
-                    host: "ok.example.com".into(),
-                    username: " ".into(),
-                    port: 22,
-                    ..ExportEndpoint::default()
-                },
-                ExportEndpoint {
+                ExportTunnel {
+                    name: "正常".into(),
                     host: "good.example.com".into(),
                     username: "ops".into(),
                     port: 22,
-                    ..ExportEndpoint::default()
+                    ..ExportTunnel::default()
                 },
             ],
-            ..ExportTunnel::default()
+            apps: vec![
+                ExportApp {
+                    name: "孤儿".into(),
+                    group: DEFAULT_GROUP_ID.into(),
+                    tunnels: vec!["脏数据".into()],
+                    local_port: 18080,
+                    remote_host: "127.0.0.1".into(),
+                    remote_port: 80,
+                    ..ExportApp::default()
+                },
+                ExportApp {
+                    name: "正常应用".into(),
+                    group: DEFAULT_GROUP_ID.into(),
+                    tunnels: vec!["正常".into()],
+                    local_port: 18081,
+                    remote_host: "127.0.0.1".into(),
+                    remote_port: 80,
+                    ..ExportApp::default()
+                },
+            ],
+            ..ExportDocument::default()
         };
-        tunnel.normalize();
-        assert_eq!(tunnel.endpoints.len(), 1);
-        assert_eq!(tunnel.endpoints[0].host, "good.example.com");
-
-        let mut empty = ExportTunnel {
-            name: "全脏".into(),
-            ..ExportTunnel::default()
-        };
-        empty.normalize();
-        assert!(empty.endpoints.is_empty());
+        let summary = apply_import(document, &store, &vault).await.unwrap();
+        assert_eq!(summary.tunnels_added, 1);
+        assert_eq!(summary.apps_added, 1);
+        assert_eq!(summary.apps_dropped, 1);
+        let snapshot = store.snapshot().await;
+        assert_eq!(snapshot.apps.len(), 1);
+        assert_eq!(snapshot.apps[0].name, "正常应用");
     }
 
     #[test]
@@ -1517,7 +1687,7 @@ mod tests {
                     "kind": EXPORT_KIND,
                     "version": EXPORT_VERSION,
                     "tunnels": [{
-                        "name": "甲", "sshHost": "h", "sshPort": 22, "sshUser": "u"
+                        "name": "甲", "host": "h", "port": 22, "username": "u"
                     }]
                 })
                 .to_string()
@@ -1563,20 +1733,16 @@ mod tests {
             kind: EXPORT_KIND.into(),
             tunnels: vec![ExportTunnel {
                 name: "生产".into(),
-                endpoints: vec![ExportEndpoint {
-                    label: "生产".into(),
-                    host: "example.com".into(),
-                    port: 22,
-                    username: "ops".into(),
-                    private_key: Some("-----BEGIN KEY-----".into()),
-                    ..ExportEndpoint::default()
-                }],
+                host: "example.com".into(),
+                port: 22,
+                username: "ops".into(),
+                private_key: Some("-----BEGIN KEY-----".into()),
                 ..ExportTunnel::default()
             }],
             apps: vec![
                 ExportApp {
                     name: "孤儿".into(),
-                    tunnel: "不存在".into(),
+                    tunnels: vec!["不存在".into()],
                     group: DEFAULT_GROUP_ID.into(),
                     local_port: 18080,
                     remote_host: "127.0.0.1".into(),
@@ -1585,7 +1751,7 @@ mod tests {
                 },
                 ExportApp {
                     name: "正常".into(),
-                    tunnel: "生产".into(),
+                    tunnels: vec!["生产".into()],
                     group: "未定义组".into(),
                     local_port: 18081,
                     remote_host: "127.0.0.1".into(),
@@ -1603,6 +1769,8 @@ mod tests {
         assert_eq!(snapshot.apps.len(), 1);
         assert_eq!(snapshot.apps[0].name, "正常");
         assert_eq!(snapshot.apps[0].group_id, DEFAULT_GROUP_ID);
+        // 引用不到的隧道名被跳过，不会留下空引用。
+        assert_eq!(snapshot.apps[0].tunnel_ids.len(), 1);
     }
 
     #[test]
@@ -1617,24 +1785,15 @@ mod tests {
 
     #[test]
     fn tunnel_names_are_bounded_and_defaulted() {
-        let unnamed = ExportTunnel {
-            endpoints: vec![ExportEndpoint {
-                host: "example.com".into(),
-                username: "ops".into(),
-                ..ExportEndpoint::default()
-            }],
-            ..ExportTunnel::default()
-        };
-        assert_eq!(display_tunnel_name("  ", &unnamed), "ops@example.com");
-        let named = ExportTunnel {
-            name: "生产".into(),
-            ..unnamed.clone()
-        };
-        assert_eq!(display_tunnel_name("生产", &named), "生产");
+        assert_eq!(display_name("  ", "ops", "example.com"), "ops@example.com");
+        assert_eq!(display_name("生产", "ops", "example.com"), "生产");
         let long = "x".repeat(80);
-        assert_eq!(display_tunnel_name(&long, &named).chars().count(), 40);
-        // 连线路都没有时也不能 panic。
-        assert_eq!(display_tunnel_name("", &ExportTunnel::default()), "root@SSH");
+        assert_eq!(display_name(&long, "ops", "h").chars().count(), 40);
+        assert_eq!(display_name("", "", ""), "root@SSH");
+        assert_eq!(split_name("NAS", "外网", "x"), "NAS · 外网");
+        assert_eq!(split_name("NAS", "  ", "frp.example.com"), "NAS · frp.example.com");
+        assert_eq!(split_name("  ", "", ""), "SSH");
+        assert_eq!(split_name(&"名".repeat(40), "外网", "x").chars().count(), 40);
     }
 
     /// 用外部工具读写我们生成的压缩包，确认跨设备可交换（默认不跑）。
@@ -1653,48 +1812,39 @@ mod tests {
             version: EXPORT_VERSION,
             kind: EXPORT_KIND.into(),
             exported_at: 1_700_000_000_000,
-            tunnels: vec![ExportTunnel {
-                name: "生产 NAS".into(),
-                endpoints: vec![
-                    ExportEndpoint {
-                        label: "家庭局域网".into(),
-                        host: "192.168.1.10".into(),
+            tunnels: vec![
+                ExportTunnel {
+                    name: "NAS · 家庭局域网".into(),
+                    host: "192.168.1.10".into(),
+                    port: 22,
+                    username: "ops".into(),
+                    private_key: Some(OPENSSH_TEST_KEY.into()),
+                    ..ExportTunnel::default()
+                },
+                ExportTunnel {
+                    name: "NAS · frp 外网".into(),
+                    host: "example.com".into(),
+                    port: 2222,
+                    username: "ops".into(),
+                    private_key: Some(OPENSSH_TEST_KEY.into()),
+                    jumps: vec![ExportJump {
+                        label: "堡垒机".into(),
+                        host: "bastion.example.com".into(),
                         port: 22,
                         username: "ops".into(),
                         private_key: Some(OPENSSH_TEST_KEY.into()),
                         passphrase: None,
-                        jumps: vec![],
-                        wifi_only: true,
-                        enabled: true,
-                    },
-                    ExportEndpoint {
-                        label: "frp 外网".into(),
-                        host: "example.com".into(),
-                        port: 2222,
-                        username: "ops".into(),
-                        private_key: Some(OPENSSH_TEST_KEY.into()),
-                        passphrase: None,
-                        jumps: vec![ExportJump {
-                            label: "堡垒机".into(),
-                            host: "bastion.example.com".into(),
-                            port: 22,
-                            username: "ops".into(),
-                            private_key: Some(OPENSSH_TEST_KEY.into()),
-                            passphrase: None,
-                        }],
-                        wifi_only: false,
-                        enabled: true,
-                    },
-                ],
-                ..ExportTunnel::default()
-            }],
+                    }],
+                    ..ExportTunnel::default()
+                },
+            ],
             groups: vec![ExportGroup {
                 name: "工作 / 家庭".into(),
             }],
             apps: vec![ExportApp {
                 name: "公司后台".into(),
                 group: "工作 / 家庭".into(),
-                tunnel: "生产 NAS".into(),
+                tunnels: vec!["NAS · frp 外网".into(), "NAS · 家庭局域网".into()],
                 local_port: 18080,
                 remote_host: "10.0.0.5".into(),
                 remote_port: 5000,

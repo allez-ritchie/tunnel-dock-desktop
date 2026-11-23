@@ -11,14 +11,6 @@ import { describeError, strings } from "../strings";
 
 export type TestEntry = TunnelTestResult | "testing";
 
-/** 首选线路的跳板级数；卡片上的“N 级跳板”只说这一条，避免误导。 */
-function primaryJumps(tunnel: TunnelView): number {
-  const preferred =
-    tunnel.endpoints.find((item) => item.id === tunnel.preferredEndpointId) ??
-    tunnel.endpoints[0];
-  return preferred?.jumps.length ?? 0;
-}
-
 interface Props {
   tunnels: TunnelView[];
   apps: AppView[];
@@ -48,7 +40,7 @@ export function TunnelsScreen({
   const rows = useMemo(
     () =>
       tunnels.map((tunnel) => {
-        const usedBy = apps.filter((app) => app.tunnelId === tunnel.id);
+        const usedBy = apps.filter((app) => app.tunnelIds.includes(tunnel.id));
         return {
           tunnel,
           usedBy,
@@ -62,6 +54,9 @@ export function TunnelsScreen({
 
   const totalAppsUsing = rows.reduce((sum, row) => sum + row.usedBy.length, 0);
   const totalRunning = rows.reduce((sum, row) => sum + row.running, 0);
+  const deleteRow = deleteConfirm
+    ? rows.find((row) => row.tunnel.id === deleteConfirm.id)
+    : undefined;
 
   return (
     <div className="screen tab-screen tunnels-screen">
@@ -157,31 +152,19 @@ export function TunnelsScreen({
                       {tunnel.chainSummary}
                     </p>
                     <div className="card-chips">
-                      {tunnel.endpoints.length > 1 ? (
-                        <Chip color="var(--primary)" icon="route">
-                          {strings.tunnelEndpointCount(tunnel.endpoints.length)}
-                        </Chip>
-                      ) : null}
                       <Chip icon="terminal">
                         {strings.tunnelKeepalive(tunnel.keepAliveSeconds)}
                       </Chip>
-                      {tunnel.dialableCount === 0 ? (
+                      {!tunnel.dialable ? (
                         <Chip color="var(--danger)" icon="alert">
-                          {strings.errorEndpointIncomplete}
-                        </Chip>
-                      ) : tunnel.dialableCount < tunnel.endpoints.length ? (
-                        <Chip color="var(--connecting)" icon="info">
-                          {strings.endpointDialableHint(
-                            tunnel.dialableCount,
-                            tunnel.endpoints.length,
-                          )}
+                          {strings.errorTunnelIncomplete}
                         </Chip>
                       ) : null}
-                      {primaryJumps(tunnel) === 0 ? (
+                      {tunnel.jumps.length === 0 ? (
                         <Chip icon="shield">{strings.editorDirect}</Chip>
                       ) : (
                         <Chip color="var(--secondary)" icon="route">
-                          {strings.tunnelJumpCount(primaryJumps(tunnel))}
+                          {strings.tunnelJumpCount(tunnel.jumps.length)}
                         </Chip>
                       )}
                       {tunnel.autoReconnect ? (
@@ -190,38 +173,6 @@ export function TunnelsScreen({
                         </Chip>
                       ) : null}
                     </div>
-
-                    {/* 多条线路时逐条列出：用户一眼就能看出首选是哪个入口。 */}
-                    {tunnel.endpoints.length > 1 ? (
-                      <ul className="tunnel-endpoint-list">
-                        {tunnel.endpoints.map((endpoint) => (
-                          <li
-                            key={endpoint.id}
-                            className={`tunnel-endpoint${
-                              endpoint.id === tunnel.preferredEndpointId
-                                ? " is-preferred"
-                                : ""
-                            }${endpoint.enabled ? "" : " is-disabled"}`}
-                          >
-                            <span className="tunnel-endpoint-name">
-                              {endpoint.id === tunnel.preferredEndpointId ? (
-                                <Icon name="star" size={12} />
-                              ) : null}
-                              {endpoint.displayName}
-                            </span>
-                            <span className="mono">{endpoint.endpoint}</span>
-                            {endpoint.wifiOnly ? (
-                              <em>{strings.endpointWifiOnlyBadge}</em>
-                            ) : null}
-                            {endpoint.enabled ? null : (
-                              <em className="is-danger">
-                                {strings.endpointDisabledBadge}
-                              </em>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : null}
 
                     {test === "testing" ? (
                       <div className="test-result is-testing">
@@ -240,40 +191,15 @@ export function TunnelsScreen({
                         />
                         <span>
                           {test.state === "success"
-                            ? test.endpointLabel
-                              ? strings.tunnelTestOkVia(
-                                  test.endpointLabel,
-                                  test.elapsedMs,
-                                )
-                              : strings.tunnelTestOk(test.elapsedMs)
+                            ? strings.tunnelTestOk(test.elapsedMs)
                             : `${strings.tunnelTestFail}：${describeError(
                                 test.errorCode,
                                 test.errorDetail,
                                 null,
-                                tunnel.name,
                               )}`}
                         </span>
                         {test.securityAlert ? (
                           <em>{strings.tunnelTestSecurity}</em>
-                        ) : null}
-                        {/* 逐线路的失败明细：多入口时“哪条路不通”才是关键信息。 */}
-                        {test.state === "failure" &&
-                        test.endpointFailures.length > 0 ? (
-                          <ul className="test-failures">
-                            {test.endpointFailures.map((failure) => (
-                              <li key={failure.endpointId}>
-                                {strings.endpointFailureLine(
-                                  failure.label,
-                                  describeError(
-                                    failure.code,
-                                    failure.detail,
-                                    null,
-                                    tunnel.name,
-                                  ),
-                                )}
-                              </li>
-                            ))}
-                          </ul>
                         ) : null}
                       </div>
                     ) : null}
@@ -333,12 +259,10 @@ export function TunnelsScreen({
         <ConfirmDialog
           title={strings.tunnelDeleteTitle}
           body={
-            (rows.find((row) => row.tunnel.id === deleteConfirm.id)?.usedBy.length ??
-              0) > 0
+            (deleteRow?.usedBy.length ?? 0) > 0
               ? strings.tunnelDeleteBody(
                   deleteConfirm.name,
-                  rows.find((row) => row.tunnel.id === deleteConfirm.id)?.usedBy
-                    .length ?? 0,
+                  deleteRow?.usedBy.length ?? 0,
                 )
               : strings.tunnelDeleteBodyUnused(deleteConfirm.name)
           }

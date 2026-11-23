@@ -66,6 +66,8 @@ export const strings = {
   appDeleteBody: (name: string) =>
     `“${name}”的转发配置将被删除，正在运行的连接会立即断开。`,
   appDeleteConfirm: "删除应用",
+  /** 应用持有多个入口时，卡片上的计数。 */
+  appTunnelCount: (count: number) => `${count} 个入口`,
   appPhaseIdle: "已停止",
   appPhaseConnecting: "连接中",
   appPhaseConnected: "转发中",
@@ -77,11 +79,11 @@ export const strings = {
   // ------------------------------------------------------------- tunnels tab
   tunnelsKicker: "SSH ACCESS",
   tunnelsTitle: "隧道",
-  tunnelsSubtitle: "可复用的 SSH 接入信息，多个应用共用同一份配置",
+  tunnelsSubtitle: "一次确定的 SSH 接入：用户名、地址、端口与跳板",
   tunnelsAdd: "新建隧道",
   tunnelsEmptyTitle: "还没有隧道",
   tunnelsEmptyBody:
-    "隧道保存 SSH 用户名、地址、端口与跳板机，应用只需引用它，无需重复输入。",
+    "隧道保存 SSH 用户名、地址、端口与跳板机。同一个服务需要多个入口时，建多条隧道并在应用里排序。",
   tunnelCardEndpoint: "SSH 接入",
   tunnelCardChain: "链路",
   tunnelAppsUsing: (count: number) => `被 ${count} 个应用使用`,
@@ -92,8 +94,6 @@ export const strings = {
   tunnelTest: "测试连接",
   tunnelTesting: "测试中…",
   tunnelTestOk: (elapsedMs: number) => `连接正常 · ${elapsedMs} ms`,
-  tunnelTestOkVia: (label: string, elapsedMs: number) =>
-    `${label} 连接正常 · ${elapsedMs} ms`,
   tunnelTestFail: "连接失败",
   tunnelTestSecurity: "安全告警",
   tunnelEdit: "编辑隧道",
@@ -107,53 +107,11 @@ export const strings = {
     `“${name}”正被 ${count} 个应用使用。删除后这些应用会停止并标记为不可用，应用配置仍然保留。`,
   tunnelDeleteBodyUnused: (name: string) => `“${name}”的 SSH 配置将被删除。`,
   tunnelDeleteConfirm: "删除隧道",
-  /** 一条隧道配置了多条线路时，卡片上的计数。 */
-  tunnelEndpointCount: (count: number) => `${count} 条线路`,
-
-  // ---------------------------------------------------------------- endpoints
-  endpointSection: "SSH 线路",
-  endpointSectionDesc:
-    "同一台 SSH 服务器可以有多条接入路径。应用启动时按顺序尝试，首选线路不可用会自动切换下一条，本地端口保持不变。",
-  endpointAdd: "添加线路",
-  endpointAddTitle: "添加线路",
-  endpointEditTitle: "编辑线路",
-  endpointLabel: "线路名称",
-  endpointLabelHint: "例如：家庭局域网 / frpc 外网",
-  endpointDefaultLabel: (index: number) => `线路 ${index}`,
-  endpointHost: "地址",
-  endpointHostHint: "域名或 IP",
-  endpointPort: "端口",
-  endpointUsername: "用户名",
-  endpointWifiOnly: "仅局域网可用",
-  endpointWifiOnlyDesc: "不在局域网时跳过这条线路，例如家里局域网的服务器",
-  endpointWifiOnlyBadge: "仅局域网",
-  endpointEnabled: "启用这条线路",
-  endpointEnabledDesc: "停用后保留配置，但连接时不会尝试",
-  endpointDisabledBadge: "已停用",
-  endpointPreferred: "设为首选",
-  endpointPreferredAuto: "自动选择",
-  endpointPreferredAutoHint: "首选线路连不上时仍会按顺序尝试其它线路",
-  endpointPreferredOn: (label: string) => `首选线路：${label}`,
-  endpointMoveUp: "上移",
-  endpointMoveDown: "下移",
-  endpointEdit: "编辑线路",
-  endpointDelete: "删除线路",
-  endpointEmpty: "还没有线路，至少添加一条才能连接。",
-  endpointCount: (count: number) => `${count} 条线路`,
-  endpointCountSuffix: (count: number) => `共 ${count} 条线路`,
-  endpointJumpCount: (count: number) => `${count} 级跳板`,
-  endpointDirect: "直连，无跳板",
-  endpointSave: "保存线路",
-  endpointInUse: (label: string) => `线路：${label}`,
-  endpointFallbackUsed: (label: string) =>
-    `首选线路不可用，已切换到“${label}”`,
-  /** 不可拨号的线路数量提示（缺凭据 / 被停用）。 */
-  endpointDialableHint: (dialable: number, total: number) =>
-    `${total} 条线路中 ${dialable} 条可用`,
-  endpointNoneDialable: "没有可用的线路，请补全地址、用户名与凭据",
-  endpointFailuresTitle: "各线路结果",
-  endpointFailureLine: (label: string, reason: string) =>
+  tunnelInUse: (label: string) => `隧道：${label}`,
+  tunnelFailureLine: (label: string, reason: string) =>
     `${label}：${reason}`,
+  /** 错误详情页里逐个入口的失败清单标题。 */
+  tunnelFailuresTitle: "各隧道结果",
 
   // --------------------------------------------------------- tunnel editor
   editorNewTunnel: "新建隧道",
@@ -165,8 +123,13 @@ export const strings = {
   editorNameHint: "例如：家庭 NAS",
   editorSshHost: "主机地址",
   editorSshHostHint: "域名或 IP",
+  editorSshPort: "端口",
+  editorSshUsername: "用户名",
   editorServerPlaceholder: "SSH 服务器",
-  editorNoEndpoint: "尚未配置线路",
+  editorNoEndpoint: "尚未配置 SSH 接入",
+  editorAccessSection: "SSH 接入",
+  editorAccessSectionDesc:
+    "一条隧道就是一次确定的接入：用户名、地址、端口、跳板与凭据。同一个服务器的另一个入口，请再建一条隧道。",
   editorAuthPassword: "密码",
   editorAuthKey: "私钥",
   editorPassword: "登录密码",
@@ -319,11 +282,22 @@ export const strings = {
   appEditorNameHint: "例如：公司后台",
   appEditorGroup: "应用组",
   appEditorGroupHint: "用于分组管理与一键启停",
-  appEditorTunnel: "隧道",
-  appEditorTunnelHint: "选择保存好的 SSH 接入信息",
+  appEditorTunnels: "隧道（按尝试顺序）",
+  appEditorTunnelsHint:
+    "第一条是首选。启动时依次尝试，首选不可用会自动切到下一条，本地端口保持不变。",
   appEditorNoTunnel: "还没有可用隧道，请先创建隧道。",
   appEditorCreateTunnel: "新建隧道",
   appEditorTunnelMissing: "原隧道已被删除，请重新选择。",
+  appEditorTunnelAdd: "添加隧道",
+  appEditorTunnelEmpty: "还没有选择隧道，至少选择一条才能转发。",
+  appEditorTunnelPreferred: "首选",
+  appEditorTunnelSetPreferred: "设为首选",
+  appEditorTunnelMoveUp: "上移",
+  appEditorTunnelMoveDown: "下移",
+  appEditorTunnelRemove: "移除",
+  appEditorTunnelOrderHint: (names: string) => `尝试顺序：${names}`,
+  appEditorFallbackUsed: (label: string) =>
+    `首选隧道不可用，已切换到“${label}”`,
   appEditorRouteSection: "转发规则",
   appEditorLocalPort: "本地端口",
   appEditorLocalPortHint: "浏览器通过 127.0.0.1:端口 访问",
@@ -416,20 +390,18 @@ export const strings = {
   errorJumpPasswordRequired: "请填写跳板机密码",
   errorJumpPrivateKeyRequired: "请粘贴跳板机私钥",
   errorMaxJumps: "最多支持 8 级跳板机",
-  errorEndpointHostRequired: "请填写线路地址",
-  errorEndpointPort: "线路端口需在 1–65535 之间",
-  errorEndpointUsernameRequired: "请填写线路用户名",
-  errorEndpointLabelTooLong: "线路名称不能超过 40 个字符",
-  errorEndpointLabelDuplicate: "线路名称不能重复",
-  errorEndpointRequired: "请至少添加一条可用线路",
-  errorEndpointAllDisabled: "该隧道的所有线路都已停用，请至少启用一条",
-  errorEndpointPasswordRequired: "请填写线路登录密码",
-  errorEndpointPrivateKeyRequired: "请粘贴线路私钥内容",
-  errorMaxEndpoints: "最多支持 8 条线路",
+  errorTunnelHostRequired: "请填写 SSH 主机地址",
+  errorTunnelPort: "SSH 端口需在 1–65535 之间",
+  errorTunnelUsernameRequired: "请填写 SSH 用户名",
+  errorTunnelPasswordRequired: "请填写 SSH 登录密码",
+  errorTunnelPrivateKeyRequired: "请粘贴 SSH 私钥内容",
   errorAppNameRequired: "请填写应用名称",
   errorAppNameTooLong: "应用名称不能超过 40 个字符",
   errorGroupRequired: "请选择应用组",
-  errorTunnelRequired: "请选择隧道",
+  errorTunnelRequired: "请至少选择一条隧道",
+  errorAppTunnelMissing: "有隧道已被删除，请重新选择。",
+  errorNoDialableTunnel: "所选隧道缺少地址、用户名或凭据，请先在隧道页补全。",
+  errorMaxAppTunnels: "一个应用最多选择 8 条隧道",
   errorLocalPort: "本地端口需在 1024–65535 之间",
   errorRemoteHostRequired: "请填写远程主机",
   errorRemotePort: "远程端口需在 1–65535 之间",
@@ -451,12 +423,10 @@ export const strings = {
   errorTunnelDown: "隧道连接失败，请检查网络、SSH 地址与凭据。",
   errorForwardFailed: "本地转发建立失败，请检查远程目标与本机端口。",
   errorPortConflict: "本地端口已被其他正在运行的应用占用，请更换端口或先停止冲突应用。",
-  errorNoEndpoint: (tunnel: string) =>
-    `隧道“${tunnel}”还没有配置任何线路，请先在隧道页添加 SSH 接入点。`,
-  errorAllEndpointsDisabled: "该隧道的所有线路都已停用，请至少启用一条。",
-  errorWifiOnlyEndpoint:
-    "该隧道只有局域网专用线路，当前不在局域网，暂不可用。",
-  errorEndpointIncomplete: "该隧道的线路缺少地址、用户名或凭据，请补全后再启动。",
+  errorNoTunnel:
+    "应用还没有选择隧道，请编辑应用并至少选择一条 SSH 接入。",
+  errorTunnelMissing: "应用引用的隧道都已被删除，请编辑应用重新选择。",
+  errorTunnelIncomplete: "所选隧道缺少地址、用户名或凭据，请补全后再启动。",
   errorGeneric: (detail: string) => `连接失败：${detail}`,
 
   toastDeleted: "已删除",
@@ -472,7 +442,6 @@ export function describeError(
   code: string | null | undefined,
   detail: string | null | undefined,
   localPort?: number | null,
-  tunnelName?: string | null,
 ): string {
   switch (code) {
     case "host_key_changed":
@@ -503,15 +472,13 @@ export function describeError(
       return strings.errorTunnelDown;
     case "forward_failed":
       return strings.errorForwardFailed;
-    // 一条线路都拨不出去时后端给出的具体原因，比“隧道连接失败”更能指导修复。
-    case "no_endpoint":
-      return strings.errorNoEndpoint(tunnelName ?? "?");
-    case "all_endpoints_disabled":
-      return strings.errorAllEndpointsDisabled;
-    case "wifi_only_endpoint":
-      return strings.errorWifiOnlyEndpoint;
-    case "endpoint_incomplete":
-      return strings.errorEndpointIncomplete;
+    // 一条隧道都拨不出去时后端给出的具体原因，比“隧道连接失败”更能指导修复。
+    case "no_tunnel":
+      return strings.errorNoTunnel;
+    case "tunnel_missing":
+      return strings.errorTunnelMissing;
+    case "tunnel_incomplete":
+      return strings.errorTunnelIncomplete;
     default:
       return strings.errorGeneric(detail ?? "未知错误");
   }

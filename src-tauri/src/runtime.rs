@@ -1,13 +1,12 @@
-use crate::endpoint_policy;
 use crate::known_hosts::KnownHosts;
 use crate::model::{
-    AppBlockReason, AppStatus, DockSnapshot, EndpointFailure, EndpointSelection, ForwardApp,
-    TestState, TunnelConfig, TunnelEndpoint, TunnelPhase, TunnelTestResult,
+    AppBlockReason, AppStatus, DockSnapshot, ForwardApp, TestState, TunnelConfig, TunnelFailure,
+    TunnelPhase, TunnelSelection, TunnelTestResult,
 };
-use crate::network;
 use crate::secrets::Secrets;
 use crate::ssh::{self, ConnectContext, ForwardSpec, TunnelError};
 use crate::store::Store;
+use crate::tunnel_policy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,15 +17,15 @@ use tokio_util::sync::CancellationToken;
 
 pub const APP_STATUS_EVENT: &str = "app-status";
 
-/// 一轮连接的结果：成功持有连接，或所有候选线路都失败。
+/// 一轮连接的结果：成功持有连接，或所有候选隧道都失败。
 struct RoundOutcome {
     connection: Option<ssh::SshTunnel>,
-    failures: Vec<EndpointFailure>,
-    /// 无法换线路解决的问题（安全 / 本地端口 / 凭据），一经出现就结束本轮。
+    failures: Vec<TunnelFailure>,
+    /// 无法换隧道解决的问题（安全 / 本地端口 / 凭据），一经出现就结束本轮。
     fatal: Option<TunnelError>,
     security_alert: bool,
-    /// 最后一条尝试的线路，用于在错误详情页指出“是哪条路失败”。
-    last_endpoint: Option<TunnelEndpoint>,
+    /// 最后一条尝试的隧道，用于在错误详情页指出“是哪条路失败”。
+    last_tunnel: Option<TunnelConfig>,
 }
 
 /// Exponential reconnect delays: 1s, 2s, 4s, 8s, 16s, then a 30s ceiling.
@@ -52,10 +51,11 @@ struct TaskEntry {
 
 /// Process-wide supervisor for forwarded applications.
 ///
-/// A [`TunnelConfig`] is reusable *configuration*; a [`ForwardApp`] forwards
-/// `local_port -> remote_host:remote_port` through one. Every running
-/// application dials its own SSH session and owns its own local listener, so
-/// applications that share a tunnel never share a transport.
+/// A [`TunnelConfig`] is a reusable *configuration* describing one definite SSH
+/// access; a [`ForwardApp`] forwards `local_port -> remote_host:remote_port`
+/// through one of the tunnels it lists. Every running application dials its own
+/// SSH session and owns its own local listener, so applications that share a
+/// tunnel never share a transport.
 pub struct Runtime {
     app: AppHandle,
     store: Arc<Store>,
@@ -64,7 +64,7 @@ pub struct Runtime {
     statuses: RwLock<HashMap<String, AppStatus>>,
     tasks: Mutex<HashMap<String, TaskEntry>>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// 每个应用上次成功承载流量的线路 id：重连时优先试它，避免反复探测刚失败的路径。
+    /// 每个应用上次成功承载流量的隧道 id：重连时优先试它，避免反复探测刚失败的路径。
     last_good: RwLock<HashMap<String, String>>,
     generation: AtomicU64,
 }
@@ -227,8 +227,8 @@ impl Runtime {
             .map_err(|error| error.to_string())
     }
 
-    /// Stops every application that uses the tunnel, keeps the applications
-    /// but marks them unavailable, then removes the tunnel definition.
+    /// Stops every application that used the tunnel and marks the ones left
+    /// without any usable tunnel unavailable, then removes the definition.
     pub async fn delete_tunnel(self: &Arc<Self>, id: &str) {
         let snapshot = self.store.snapshot().await;
         for app in snapshot.apps_using_tunnel(id) {
@@ -236,12 +236,23 @@ impl Runtime {
             let _guard = lock.lock().await;
             self.store.set_app_desired(&app.id, false).await.ok();
             self.stop_task(&app.id).await;
-            self.set_status(AppStatus::blocked(
-                &app.id,
-                app.local_port,
-                AppBlockReason::TunnelDeleted,
-            ))
-            .await;
+            // 应用还引用了别的隧道时只是“被停掉”，不该被标记成隧道已删除；
+            // 真正没路可走的才需要红色叹号与错误详情。
+            let remaining = app
+                .tunnel_ids
+                .iter()
+                .filter(|tunnel_id| tunnel_id.as_str() != id)
+                .filter(|tunnel_id| snapshot.tunnel(tunnel_id).is_some())
+                .count();
+            let status = if remaining == 0 {
+                AppStatus::blocked(&app.id, app.local_port, AppBlockReason::TunnelDeleted)
+            } else {
+                AppStatus {
+                    local_port: Some(app.local_port),
+                    ..AppStatus::idle(&app.id)
+                }
+            };
+            self.set_status(status).await;
         }
         self.store.delete_tunnel(id).await.ok();
     }
@@ -278,11 +289,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// Opens a throwaway SSH session per endpoint (no local forward) and closes
-    /// it, so "测试连接" exercises auth, the jump chain and host key checks
-    /// without touching any running application. Lines are tried in policy
-    /// order and the first success wins; every failure is reported when none
-    /// works.
+    /// Opens a throwaway SSH session (no local forward) and closes it, so
+    /// "测试连接" exercises auth, the jump chain and host key checks without
+    /// touching any running application. A tunnel is one definite access path,
+    /// so the probe either authenticates or reports why it could not.
     pub async fn test_tunnel(&self, id: &str) -> TunnelTestResult {
         let started = Instant::now();
         let snapshot = self.store.snapshot().await;
@@ -294,87 +304,51 @@ impl Runtime {
                 error_code: Some("tunnel_deleted".into()),
                 error_detail: None,
                 security_alert: false,
-                endpoint_label: None,
-                endpoint_failures: Vec::new(),
             };
         };
         // 跳板机的凭据可能来自定义同一主机的另一条隧道，测试与真实连接共用同一套解析。
         let tunnel = snapshot.with_inherited_jump_credentials(tunnel);
-        let on_local_network = network::on_local_network();
-        let candidates = endpoint_policy::order(
-            &tunnel,
-            tunnel.preferred_endpoint_id.as_deref(),
-            None,
-            on_local_network,
-        );
-        if candidates.is_empty() {
-            let reason = endpoint_policy::no_candidate_reason(&tunnel, on_local_network);
-            tracing::warn!(tunnel = %tunnel.name, code = reason.error_code(), "隧道没有可用线路");
+        if !tunnel.is_dialable() {
+            tracing::warn!(tunnel = %tunnel.name, code = "tunnel_incomplete", "隧道配置不完整");
             return TunnelTestResult {
                 tunnel_id: id.to_string(),
                 state: TestState::Failure,
                 elapsed_ms: started.elapsed().as_millis() as u64,
-                error_code: Some(reason.error_code().to_string()),
+                error_code: Some("tunnel_incomplete".into()),
                 error_detail: None,
                 security_alert: false,
-                endpoint_label: None,
-                endpoint_failures: Vec::new(),
             };
         }
 
         let context = self.connect_context();
-        let mut failures: Vec<EndpointFailure> = Vec::new();
-        let mut security_alert = false;
-        // 用普通循环而不是迭代器：安全类失败必须真的中断探测，
-        // 否则下一条线路会把真正的原因盖住。
-        for endpoint in candidates {
-            match ssh::probe(&context, &tunnel, endpoint).await {
-                Ok(()) => {
-                    tracing::info!(
-                        tunnel = %tunnel.name,
-                        endpoint = %endpoint.display_name(),
-                        "隧道连接测试成功"
-                    );
-                    return TunnelTestResult {
-                        tunnel_id: id.to_string(),
-                        state: TestState::Success,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                        error_code: None,
-                        error_detail: None,
-                        security_alert,
-                        endpoint_label: Some(endpoint.display_name().to_string()),
-                        endpoint_failures: failures,
-                    };
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        tunnel = %tunnel.name,
-                        endpoint = %endpoint.display_name(),
-                        code = error.code(),
-                        detail = error.detail().unwrap_or_default(),
-                        "隧道连接测试失败"
-                    );
-                    security_alert |= error.security_alert();
-                    failures.push(endpoint_failure(endpoint, &error));
-                    if !endpoint_policy::is_endpoint_scoped(&error) {
-                        break;
-                    }
+        match ssh::probe(&context, &tunnel).await {
+            Ok(()) => {
+                tracing::info!(tunnel = %tunnel.name, "隧道连接测试成功");
+                TunnelTestResult {
+                    tunnel_id: id.to_string(),
+                    state: TestState::Success,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    error_code: None,
+                    error_detail: None,
+                    security_alert: false,
                 }
             }
-        }
-
-        let first = failures
-            .first()
-            .expect("an empty candidate list returned above");
-        TunnelTestResult {
-            tunnel_id: id.to_string(),
-            state: TestState::Failure,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            error_code: Some(first.code.clone()),
-            error_detail: first.detail.clone(),
-            security_alert,
-            endpoint_label: None,
-            endpoint_failures: failures,
+            Err(error) => {
+                tracing::warn!(
+                    tunnel = %tunnel.name,
+                    code = error.code(),
+                    detail = error.detail().unwrap_or_default(),
+                    "隧道连接测试失败"
+                );
+                TunnelTestResult {
+                    tunnel_id: id.to_string(),
+                    state: TestState::Failure,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    error_code: Some(error.code().to_string()),
+                    error_detail: error.detail(),
+                    security_alert: error.security_alert(),
+                }
+            }
         }
     }
 
@@ -473,11 +447,11 @@ impl Runtime {
         });
     }
 
-    /// Supervises one application: resolve the endpoint list for this round,
-    /// dial the first line that works, keep it healthy, and fall to the next
-    /// line when a path dies. The local port never changes, so whoever is
-    /// calling `127.0.0.1:port` does not notice the path switch. Only when
-    /// *every* candidate failed does the round back off.
+    /// Supervises one application: resolve the tunnel list for this round, dial
+    /// the first one that works, keep it healthy, and fall to the next tunnel
+    /// when a path dies. The local port never changes, so whoever is calling
+    /// `127.0.0.1:port` does not notice the path switch. Only when *every*
+    /// candidate failed does the round back off.
     async fn run_app(
         self: Arc<Self>,
         app: ForwardApp,
@@ -510,8 +484,8 @@ impl Runtime {
                         failure.as_ref().and_then(|item| item.detail.clone()),
                         last_round.as_ref().map(block_reason_for).unwrap_or(AppBlockReason::None),
                     )
-                    .with_endpoint_route(
-                        last_round.as_ref().and_then(selected_endpoint),
+                    .with_tunnel_route(
+                        last_round.as_ref().and_then(selected_tunnel),
                         last_round
                             .as_ref()
                             .map(|round| round.failures.clone())
@@ -534,38 +508,17 @@ impl Runtime {
             };
             if !current.desired_on {
                 break;
-            }
-            let Some(tunnel) = snapshot.tunnel(&current.tunnel_id).cloned() else {
-                self.store.set_app_desired(&app_id, false).await.ok();
-                self.forget_last_good(&app_id).await;
-                self.set_status(AppStatus::blocked(
-                    &app_id,
-                    current.local_port,
-                    AppBlockReason::TunnelDeleted,
-                ))
-                .await;
-                break;
             };
-            // 跳板机的凭据可能由另一条隧道提供，连接前统一解析出来。
-            let tunnel = snapshot.with_inherited_jump_credentials(&tunnel);
-
-            let forward = ForwardSpec::from(&current);
-            let last_good = self.last_good_endpoint(&app_id).await;
-            let on_local_network = network::on_local_network();
-            let candidates = endpoint_policy::order(
-                &tunnel,
-                tunnel.preferred_endpoint_id.as_deref(),
-                last_good.as_deref(),
-                on_local_network,
-            );
+            // 隧道都在这里解析：连接路径与界面状态必须看到同一份凭据。
+            let mut candidates = tunnel_policy::candidates(&snapshot, &current);
             if candidates.is_empty() {
-                // 配置层面就拨不出去（没有线路 / 全停用 / 缺凭据）：别说成“正在重连”，
-                // 直接停下并说明原因，否则用户只会看到一直转圈。
-                let reason = endpoint_policy::no_candidate_reason(&tunnel, on_local_network);
+                // 配置层面就拨不出去（没选隧道 / 隧道全被删 / 缺凭据）：别说成
+                // “正在重连”，直接停下并说明原因，否则用户只会看到一直转圈。
+                let reason = tunnel_policy::no_tunnel_reason(&snapshot, &current);
                 tracing::warn!(
                     app = %current.name,
                     code = reason.error_code(),
-                    "应用没有可用线路，停止重连"
+                    "应用没有可用隧道，停止重连"
                 );
                 self.store.set_app_desired(&app_id, false).await.ok();
                 self.forget_last_good(&app_id).await;
@@ -575,58 +528,76 @@ impl Runtime {
                     reason.error_code().to_string(),
                     None,
                     false,
-                    AppBlockReason::TunnelDown,
+                    match reason {
+                        tunnel_policy::NoTunnelReason::TunnelMissing => {
+                            AppBlockReason::TunnelDeleted
+                        }
+                        _ => AppBlockReason::TunnelDown,
+                    },
                 ))
                 .await;
                 break;
             }
+            // 上次成功的隧道优先，但顺序稳定：其余隧道保持应用里的声明顺序。
+            let last_good = self.last_good_tunnel(&app_id).await;
+            if let Some(last_good) = last_good {
+                if let Some(index) = candidates
+                    .iter()
+                    .position(|tunnel| tunnel.id == last_good)
+                {
+                    let preferred = candidates.remove(index);
+                    candidates.insert(0, preferred);
+                }
+            }
 
             // The per-candidate "connecting" status is published inside the dial
             // loop below, right before each attempt.
-
             let mut round = RoundOutcome {
                 connection: None,
                 failures: Vec::new(),
                 fatal: None,
                 security_alert: false,
-                last_endpoint: None,
+                last_tunnel: None,
             };
-            for endpoint in candidates {
+            let forward = ForwardSpec::from(&current);
+            for tunnel in candidates {
                 if token.is_cancelled() {
                     break;
                 }
-                // 报告“正在连接哪一条线路”：第一条只管说“连接中”，后续的说明是在
-                // 回退，界面据此显示“首选线路不可用，正在尝试 …”。
+                // 报告“正在连接哪个隧道”：第一条只管说“连接中”，后续的说明是在
+                // 回退，界面据此显示“首选隧道不可用，正在尝试 …”。
                 self.set_status(
-                    AppStatus::connecting(&app_id, current.local_port).with_endpoint_route(
-                        Some(EndpointSelection::of(endpoint)),
+                    AppStatus::connecting(&app_id, current.local_port).with_tunnel_route(
+                        Some(TunnelSelection::of(tunnel)),
                         round.failures.clone(),
                     ),
                 )
                 .await;
+                // 跳板机凭据可能由别的隧道提供，连接前统一解析出来。
+                let resolved = snapshot.with_inherited_jump_credentials(tunnel);
                 let result = tokio::select! {
                     _ = token.cancelled() => break,
-                    result = ssh::connect(&context, &tunnel, endpoint, &forward) => result,
+                    result = ssh::connect(&context, &resolved, &forward) => result,
                 };
                 match result {
                     Ok(connection) => {
                         round.connection = Some(connection);
-                        round.last_endpoint = Some(endpoint.clone());
+                        round.last_tunnel = Some(tunnel.clone());
                         break;
                     }
                     Err(error) => {
                         tracing::warn!(
                             app = %current.name,
-                            endpoint = %endpoint.display_name(),
+                            tunnel = %tunnel.name,
                             code = error.code(),
                             detail = error.detail().unwrap_or_default(),
-                            "应用线路连接失败"
+                            "应用隧道连接失败"
                         );
                         round.security_alert |= error.security_alert();
-                        round.failures.push(endpoint_failure(endpoint, &error));
-                        round.last_endpoint = Some(endpoint.clone());
-                        // 安全类 / 本地端口类问题换线路解决不了，还会把真正的原因盖住。
-                        if !endpoint_policy::is_endpoint_scoped(&error) {
+                        round.failures.push(tunnel_failure(tunnel, &error));
+                        round.last_tunnel = Some(tunnel.clone());
+                        // 安全类 / 本地端口类问题换隧道解决不了，还会把真正的原因盖住。
+                        if !tunnel_policy::is_tunnel_scoped(&error) {
                             round.fatal = Some(error);
                             break;
                         }
@@ -643,18 +614,17 @@ impl Runtime {
             match round.connection.take() {
                 Some(mut connection) => {
                     attempt = 0;
-                    let endpoint = round
-                        .last_endpoint
+                    let tunnel = round
+                        .last_tunnel
                         .as_ref()
-                        .expect("a connection always records its endpoint")
+                        .expect("a connection always records its tunnel")
                         .clone();
-                    self.remember_last_good(&app_id, &endpoint.id).await;
+                    self.remember_last_good(&app_id, &tunnel.id).await;
                     self.set_status(
-                        AppStatus::connected(&app_id, connection.local_port())
-                            .with_endpoint_route(
-                                Some(EndpointSelection::of(&endpoint)),
-                                round.failures.clone(),
-                            ),
+                        AppStatus::connected(&app_id, connection.local_port()).with_tunnel_route(
+                            Some(TunnelSelection::of(&tunnel)),
+                            round.failures.clone(),
+                        ),
                     )
                     .await;
                     let reason = tokio::select! {
@@ -672,14 +642,14 @@ impl Runtime {
                     }
                     tracing::warn!(
                         app = %current.name,
-                        endpoint = %endpoint.display_name(),
+                        tunnel = %tunnel.name,
                         reason = %reason,
                         "应用转发中断"
                     );
                     round.security_alert = reason.security_alert();
-                    round.failures = vec![endpoint_failure(&endpoint, &reason)];
+                    round.failures = vec![tunnel_failure(&tunnel, &reason)];
                     round.fatal = Some(reason);
-                    round.last_endpoint = Some(endpoint);
+                    round.last_tunnel = Some(tunnel);
                     last_round = Some(round);
                 }
                 None => last_round = Some(round),
@@ -688,14 +658,20 @@ impl Runtime {
             let round = last_round
                 .as_ref()
                 .expect("every round ends with either a connection or failures");
-            // 只有“换条线路也没用”的失败才终止整个应用：安全类、本地端口类、
+            // 只有“换条隧道也没用”的失败才终止整个应用：安全类、本地端口类、
             // 凭据不可用，以及用户关掉了自动重连。
             let fatal = round.fatal.as_ref();
+            // “自动重连”由这一轮实际使用（或最后尝试）的隧道决定，而不是任意一条。
+            let auto_reconnect = round
+                .last_tunnel
+                .as_ref()
+                .map(|tunnel| tunnel.auto_reconnect)
+                .unwrap_or(true);
             let must_stop = round.security_alert
-                || !tunnel.auto_reconnect
+                || !auto_reconnect
                 || fatal.is_some_and(|error| {
-                    endpoint_policy::is_security_failure(error)
-                        || endpoint_policy::is_local_port_failure(error)
+                    tunnel_policy::is_security_failure(error)
+                        || tunnel_policy::is_local_port_failure(error)
                         || matches!(
                             error,
                             TunnelError::MissingCredential | TunnelError::SecretDecrypt
@@ -717,7 +693,7 @@ impl Runtime {
                         round.security_alert,
                         block_reason_for(round),
                     )
-                    .with_endpoint_route(selected_endpoint(round), round.failures.clone()),
+                    .with_tunnel_route(selected_tunnel(round), round.failures.clone()),
                 )
                 .await;
                 break;
@@ -753,15 +729,15 @@ impl Runtime {
         AppStatus::blocked(&app.id, app.local_port, reason)
     }
 
-    async fn last_good_endpoint(&self, app_id: &str) -> Option<String> {
+    async fn last_good_tunnel(&self, app_id: &str) -> Option<String> {
         self.last_good.read().await.get(app_id).cloned()
     }
 
-    async fn remember_last_good(&self, app_id: &str, endpoint_id: &str) {
+    async fn remember_last_good(&self, app_id: &str, tunnel_id: &str) {
         self.last_good
             .write()
             .await
-            .insert(app_id.to_string(), endpoint_id.to_string());
+            .insert(app_id.to_string(), tunnel_id.to_string());
     }
 
     async fn forget_last_good(&self, app_id: &str) {
@@ -829,7 +805,11 @@ impl Runtime {
 
 /// Why an application cannot start right now, given the current definitions.
 fn blocking_reason(snapshot: &DockSnapshot, app: &ForwardApp) -> Option<AppBlockReason> {
-    if snapshot.tunnel(&app.tunnel_id).is_none() {
+    let has_tunnel = app
+        .tunnel_ids
+        .iter()
+        .any(|id| snapshot.tunnel(id).is_some());
+    if !has_tunnel {
         return Some(AppBlockReason::TunnelDeleted);
     }
     if snapshot.group(&app.group_id).is_none() {
@@ -868,16 +848,16 @@ fn block_reason_for(round: &RoundOutcome) -> AppBlockReason {
     }
 }
 
-/// 本轮最后一次被尝试的线路，错误详情页据此指出“是哪条路失败”。
-fn selected_endpoint(round: &RoundOutcome) -> Option<EndpointSelection> {
-    round.last_endpoint.as_ref().map(EndpointSelection::of)
+/// 本轮最后一次被尝试的隧道，错误详情页据此指出“是哪条路失败”。
+fn selected_tunnel(round: &RoundOutcome) -> Option<TunnelSelection> {
+    round.last_tunnel.as_ref().map(TunnelSelection::of)
 }
 
 /// 把一次失败压成前端可见的、语言无关的记录。
-fn endpoint_failure(endpoint: &TunnelEndpoint, error: &TunnelError) -> EndpointFailure {
-    EndpointFailure {
-        endpoint_id: endpoint.id.clone(),
-        label: endpoint.display_name().to_string(),
+fn tunnel_failure(tunnel: &TunnelConfig, error: &TunnelError) -> TunnelFailure {
+    TunnelFailure {
+        tunnel_id: tunnel.id.clone(),
+        name: tunnel.name.clone(),
         code: error.code().to_string(),
         detail: error.detail(),
     }
@@ -886,10 +866,12 @@ fn endpoint_failure(endpoint: &TunnelEndpoint, error: &TunnelError) -> EndpointF
 #[cfg(test)]
 mod tests {
     use super::{
-        block_reason_for, blocking_reason, endpoint_failure, selected_endpoint, ReconnectPolicy,
+        block_reason_for, blocking_reason, selected_tunnel, tunnel_failure, ReconnectPolicy,
         RoundOutcome,
     };
-    use crate::model::{AppBlockReason, AppGroup, DockSnapshot, ForwardApp, TunnelConfig};
+    use crate::model::{
+        AppBlockReason, AppGroup, AuthType, DockSnapshot, ForwardApp, SshCredentials, TunnelConfig,
+    };
     use crate::ssh::TunnelError;
 
     #[test]
@@ -912,33 +894,33 @@ mod tests {
         assert_eq!(ReconnectPolicy::backoff_seconds(0), 1);
     }
 
-    fn document() -> DockSnapshot {
-        let tunnel = TunnelConfig {
-            id: "t1".into(),
-            name: "NAS".into(),
-            endpoints: vec![crate::model::TunnelEndpoint {
-                host: "example.com".into(),
-                username: "ops".into(),
-                credentials: crate::model::SshCredentials {
-                    auth_type: crate::model::AuthType::Password,
-                    password_cipher: Some("v1.aa.bb".into()),
-                    ..crate::model::SshCredentials::default()
-                },
-                ..crate::model::TunnelEndpoint::default()
-            }],
+    fn tunnel(id: &str, host: &str) -> TunnelConfig {
+        TunnelConfig {
+            id: id.into(),
+            name: id.into(),
+            host: host.into(),
+            username: "ops".into(),
+            credentials: SshCredentials {
+                auth_type: AuthType::Password,
+                password_cipher: Some("v1.aa.bb".into()),
+                ..SshCredentials::default()
+            },
             ..TunnelConfig::default()
-        };
+        }
+    }
+
+    fn document() -> DockSnapshot {
         let app = ForwardApp {
             id: "a1".into(),
             name: "Web".into(),
-            tunnel_id: "t1".into(),
+            tunnel_ids: vec!["t1".into()],
             group_id: "default".into(),
             local_port: 18080,
             remote_host: "127.0.0.1".into(),
             ..ForwardApp::default()
         };
         DockSnapshot {
-            tunnels: vec![tunnel],
+            tunnels: vec![tunnel("t1", "example.com")],
             apps: vec![app],
             groups: vec![AppGroup::default_group()],
             ..DockSnapshot::default()
@@ -960,6 +942,15 @@ mod tests {
             blocking_reason(&snapshot, &snapshot.apps[0]),
             Some(AppBlockReason::TunnelDeleted)
         );
+    }
+
+    /// 应用选了多条隧道时，只要还有一条存在就不算“隧道已删除”。
+    #[test]
+    fn start_validation_tolerates_one_deleted_tunnel_when_another_remains() {
+        let mut snapshot = document();
+        snapshot.tunnels.push(tunnel("t2", "frp.example.com"));
+        snapshot.apps[0].tunnel_ids = vec!["gone".into(), "t2".into()];
+        assert_eq!(blocking_reason(&snapshot, &snapshot.apps[0]), None);
     }
 
     #[test]
@@ -994,7 +985,7 @@ mod tests {
             failures: Vec::new(),
             fatal,
             security_alert: false,
-            last_endpoint: None,
+            last_tunnel: None,
         }
     }
 
@@ -1022,48 +1013,38 @@ mod tests {
         );
     }
 
-    /// 一轮连接把每条线路的失败压成前端可读的记录，线路名与错误码都要在。
+    /// 一轮连接把每条隧道的失败压成前端可读的记录，隧道名与错误码都要在。
     #[test]
-    fn a_failed_endpoint_is_reported_with_its_label_and_code() {
-        let endpoint = crate::model::TunnelEndpoint {
-            label: "家庭局域网".into(),
+    fn a_failed_tunnel_is_reported_with_its_name_and_code() {
+        let failed = TunnelConfig {
+            name: "家庭局域网".into(),
             host: "192.168.1.10".into(),
             username: "ops".into(),
-            ..crate::model::TunnelEndpoint::default()
+            ..TunnelConfig::default()
         };
-        let failure = endpoint_failure(&endpoint, &TunnelError::Timeout);
-        assert_eq!(failure.label, "家庭局域网");
+        let failure = tunnel_failure(&failed, &TunnelError::Timeout);
+        assert_eq!(failure.name, "家庭局域网");
         assert_eq!(failure.code, "timeout");
-        assert_eq!(failure.endpoint_id, endpoint.id);
+        assert_eq!(failure.tunnel_id, failed.id);
         assert!(failure.detail.is_none());
-
-        // 没有备注名时用主机地址，绝不出现空标签。
-        let unnamed = crate::model::TunnelEndpoint {
-            host: "frp.example.com".into(),
-            ..crate::model::TunnelEndpoint::default()
-        };
-        assert_eq!(
-            endpoint_failure(&unnamed, &TunnelError::Connect("boom".into())).label,
-            "frp.example.com"
-        );
     }
 
     #[test]
-    fn the_failed_round_names_the_last_endpoint_it_tried() {
-        let endpoint = crate::model::TunnelEndpoint {
+    fn the_failed_round_names_the_last_tunnel_it_tried() {
+        let away = TunnelConfig {
             id: "away".into(),
-            label: "frp 外网".into(),
+            name: "frp 外网".into(),
             host: "frp.example.com".into(),
             username: "ops".into(),
-            ..crate::model::TunnelEndpoint::default()
+            ..TunnelConfig::default()
         };
         let mut round = round_with(None);
-        round.last_endpoint = Some(endpoint.clone());
-        let selected = selected_endpoint(&round).expect("the round tried a line");
-        assert_eq!(selected.endpoint_id, "away");
-        assert_eq!(selected.label, "frp 外网");
+        round.last_tunnel = Some(away.clone());
+        let selected = selected_tunnel(&round).expect("the round tried a tunnel");
+        assert_eq!(selected.tunnel_id, "away");
+        assert_eq!(selected.name, "frp 外网");
         assert_eq!(selected.endpoint, "ops@frp.example.com:22");
 
-        assert!(selected_endpoint(&round_with(None)).is_none());
+        assert!(selected_tunnel(&round_with(None)).is_none());
     }
 }

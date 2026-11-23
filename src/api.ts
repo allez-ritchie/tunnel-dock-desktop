@@ -40,51 +40,31 @@ export interface JumpView {
   inheritedFrom: string | null;
 }
 
-/** One SSH line: how to reach the same SSH server. */
-export interface EndpointView {
+/**
+ * 一次确定的 SSH 接入：用户名 / 地址 / 端口 / 跳板链。
+ *
+ * 隧道只描述一条接入路径，不持有本地端口与远程目标；需要多个入口时由应用持有
+ * 多条隧道并按顺序尝试，本地端口对第三方保持不变。
+ */
+export interface TunnelView {
   id: string;
-  label: string;
-  /** 线路名，没有名字时回落到主机地址。 */
-  displayName: string;
+  name: string;
   host: string;
   port: number;
   username: string;
   credentials: CredentialState;
   jumps: JumpView[];
-  /** 只在连上局域网（家里的服务器）时才尝试这条线路。 */
-  wifiOnly: boolean;
-  enabled: boolean;
-  /** `user@host:port`，列表里直接展示。 */
-  endpoint: string;
-  chainSummary: string;
-  /** 启用 + 地址/用户/端口/凭据齐全。 */
-  dialable: boolean;
-}
-
-/**
- * Reusable SSH access definition. Holds no local port and no remote target.
- *
- * A tunnel carries an ordered list of endpoints so the same application keeps
- * its local port while the *path* to the server depends on the situation
- * (home LAN vs. an frp reverse proxy, for example).
- */
-export interface TunnelView {
-  id: string;
-  name: string;
-  endpoints: EndpointView[];
   autoReconnect: boolean;
   keepAliveSeconds: number;
   connectTimeoutSeconds: number;
   strictHostKey: boolean;
-  /** 用户钉住的首选线路；null 表示自动（按声明顺序）。 */
-  preferredEndpointId: string | null;
   createdAt: number;
   updatedAt: number;
-  /** 首选线路（或第一条）的 `user@host:port`。 */
+  /** `user@host:port`，列表里直接展示。 */
   endpoint: string;
   chainSummary: string;
-  /** 配置完整、当前可拨号的线路数量。 */
-  dialableCount: number;
+  /** 地址 / 用户名 / 端口 / 凭据齐全。 */
+  dialable: boolean;
 }
 
 /** One `localPort -> remoteHost:remotePort` forwarding rule. */
@@ -92,7 +72,8 @@ export interface AppView {
   id: string;
   name: string;
   groupId: string;
-  tunnelId: string;
+  /** 按尝试顺序排列的隧道，第一条是首选。 */
+  tunnelIds: string[];
   localPort: number;
   remoteHost: string;
   remotePort: number;
@@ -112,19 +93,19 @@ export interface GroupView {
   createdAt: number;
 }
 
-/** Why one endpoint could not be used during the most recent connect round. */
-export interface EndpointFailure {
-  endpointId: string;
-  label: string;
+/** Why one tunnel could not be used during the most recent connect round. */
+export interface TunnelFailure {
+  tunnelId: string;
+  name: string;
   /** 语言无关的错误码，文案由界面提供。 */
   code: string;
   detail: string | null;
 }
 
-/** Which line is actually carrying the traffic right now. */
-export interface EndpointSelection {
-  endpointId: string;
-  label: string;
+/** Which tunnel is actually carrying the traffic right now. */
+export interface TunnelSelection {
+  tunnelId: string;
+  name: string;
   endpoint: string;
 }
 
@@ -139,10 +120,10 @@ export interface AppStatus {
   errorCode: string | null;
   errorDetail: string | null;
   securityAlert: boolean;
-  /** 当前（或最后一次尝试）承载转发的线路。 */
-  endpoint: EndpointSelection | null;
-  /** 本轮已经失败的线路，按尝试顺序。 */
-  endpointFailures: EndpointFailure[];
+  /** 当前（或最后一次尝试）承载转发的隧道。 */
+  tunnel: TunnelSelection | null;
+  /** 本轮已经失败的隧道，按尝试顺序。 */
+  tunnelFailures: TunnelFailure[];
   updatedAt: number;
 }
 
@@ -153,10 +134,6 @@ export interface TunnelTestResult {
   errorCode: string | null;
   errorDetail: string | null;
   securityAlert: boolean;
-  /** 测试成功的线路名。 */
-  endpointLabel: string | null;
-  /** 逐条线路的失败原因。 */
-  endpointFailures: EndpointFailure[];
 }
 
 export interface DockView {
@@ -188,35 +165,26 @@ export interface JumpInput {
   credentials: CredentialInput;
 }
 
-export interface EndpointInput {
+export interface TunnelInput {
   id: string | null;
-  label: string;
+  name: string;
   host: string;
   port: number;
   username: string;
   credentials: CredentialInput;
   jumps: JumpInput[];
-  wifiOnly: boolean;
-  enabled: boolean;
-}
-
-export interface TunnelInput {
-  id: string | null;
-  name: string;
-  endpoints: EndpointInput[];
   autoReconnect: boolean;
   keepAliveSeconds: number;
   connectTimeoutSeconds: number;
   strictHostKey: boolean;
-  /** 首选线路；null 表示自动（按声明顺序）。 */
-  preferredEndpointId: string | null;
 }
 
 export interface AppInput {
   id: string | null;
   name: string;
   groupId: string;
-  tunnelId: string;
+  /** 按尝试顺序排列的隧道，第一条是首选。 */
+  tunnelIds: string[];
   localPort: number;
   remoteHost: string;
   remotePort: number;

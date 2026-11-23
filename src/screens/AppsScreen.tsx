@@ -13,8 +13,9 @@ import {
   phaseColor,
 } from "../components/ui";
 import {
+  activeTunnel,
   appUnavailable,
-  preferredEndpoint,
+  primaryTunnel,
   resolveAppStatus,
   usedFallback,
 } from "../status";
@@ -70,25 +71,25 @@ export function AppsScreen({
   const [deleteTarget, setDeleteTarget] = useState<AppView | null>(null);
   const [groupDelete, setGroupDelete] = useState<GroupView | null>(null);
 
-  const tunnelMap = useMemo(
-    () => new Map(tunnels.map((tunnel) => [tunnel.id, tunnel])),
-    [tunnels],
-  );
   const groupMap = useMemo(
     () => new Map(groups.map((group) => [group.id, group])),
     [groups],
   );
 
   const items = apps.map((app) => {
-    const tunnel = tunnelMap.get(app.tunnelId);
     const group = groupMap.get(app.groupId);
     const status = resolveAppStatus(app, tunnels, groups, statuses);
+    // 首选隧道用来展示“属于哪个服务”，实际在用的隧道由运行状态决定。
+    // 可用性看的是“还有没有一条能用的隧道”：首选被删但备用还在时不该标红。
+    const route = activeTunnel(app, tunnels, status);
+    const tunnel = primaryTunnel(app, tunnels) ?? route;
     return {
       app,
       tunnel,
+      route,
       group,
       status,
-      unavailable: appUnavailable(tunnel, group, status),
+      unavailable: appUnavailable(route, group, status),
     };
   });
 
@@ -392,15 +393,13 @@ export function AppsScreen({
 
 interface CardItem {
   app: AppView;
+  /** 首选隧道：应用声明的第一条。 */
   tunnel: TunnelView | undefined;
+  /** 实际承载流量的隧道（运行时决定，可能已回退到后面那条）。 */
+  route: TunnelView | undefined;
   group: GroupView | undefined;
   status: AppStatus;
   unavailable: boolean;
-}
-
-/** 首选线路的跳板级数（多线路时各条线路的跳板可能不同）。 */
-function jumpsOf(tunnel: TunnelView): number {
-  return preferredEndpoint(tunnel)?.jumps.length ?? 0;
 }
 
 function AppCard({
@@ -424,17 +423,16 @@ function AppCard({
   onOpenBrowser: () => void;
   onCopy: () => void;
 }) {
-  const { app, tunnel, status, unavailable } = item;
+  const { app, tunnel, route, status, unavailable } = item;
   const color = unavailable ? "var(--danger)" : phaseColor(status.phase);
   const live = ["connected", "connecting", "reconnecting"].includes(status.phase);
-  const fallback = usedFallback(status, tunnel);
+  const fallback = usedFallback(status, app);
   const errorText =
     unavailable || status.errorCode
       ? describeError(
           status.errorCode ?? (unavailable ? "tunnel_deleted" : null),
           status.errorDetail,
           app.localPort,
-          tunnel?.name,
         )
       : null;
 
@@ -543,13 +541,13 @@ function AppCard({
       </div>
 
       <div className="card-chips">
-        {tunnel && tunnel.endpoints.length > 1 ? (
+        {app.tunnelIds.length > 1 ? (
           <Chip color="var(--primary)" icon="route">
-            {strings.tunnelEndpointCount(tunnel.endpoints.length)}
+            {strings.appTunnelCount(app.tunnelIds.length)}
           </Chip>
-        ) : tunnel && jumpsOf(tunnel) > 0 ? (
+        ) : tunnel && tunnel.jumps.length > 0 ? (
           <Chip color="var(--secondary)" icon="route">
-            {strings.tunnelJumpCount(jumpsOf(tunnel))}
+            {strings.tunnelJumpCount(tunnel.jumps.length)}
           </Chip>
         ) : null}
         {app.autoStartOnBoot ? (
@@ -597,19 +595,19 @@ function AppCard({
       ) : null}
 
       {/*
-       * 走的是哪条线路：本地端口对第三方透明，但用户自己必须看得见当前入口，
+       * 走的是哪条隧道：本地端口对第三方透明，但用户自己必须看得见当前入口，
        * 否则“为什么在家能连、公司不能”无从判断。
        */}
-      {status.endpoint ? (
+      {route && app.tunnelIds.length > 1 ? (
         <p className={`card-endpoint mono${fallback ? " is-fallback" : ""}`}>
           <Icon name="route" size={12} />
-          {strings.endpointInUse(status.endpoint.label)}
+          {strings.tunnelInUse(route.name)}
         </p>
       ) : null}
-      {fallback && status.endpoint ? (
+      {fallback && route ? (
         <p className="card-fallback">
           <Icon name="swap" size={12} />
-          {strings.endpointFallbackUsed(status.endpoint.label)}
+          {strings.appEditorFallbackUsed(route.name)}
         </p>
       ) : null}
 

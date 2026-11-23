@@ -1,14 +1,13 @@
 mod commands;
-mod endpoint_policy;
 mod known_hosts;
 mod local_ssh;
 mod model;
-mod network;
 mod portable;
 mod runtime;
 mod secrets;
 mod ssh;
 mod store;
+mod tunnel_policy;
 
 use known_hosts::KnownHosts;
 use local_ssh::LocalSsh;

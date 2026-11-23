@@ -11,8 +11,11 @@ pub const DEFAULT_GROUP_NAME: &str = "default";
 /// 文档版本历史：
 ///  - 1：裸数组，SSH 接入信息与转发规则混在一条配置里；
 ///  - 2：隧道 / 应用 / 应用组拆成独立实体；
-///  - 3：一条隧道持有**一组有序的 SSH 线路**，应用配置不变，因此本地端口对第三方透明。
-pub const SNAPSHOT_VERSION: u32 = 3;
+///  - 3：一条隧道持有**一组有序的 SSH 线路**；
+///  - 4：线路概念取消。一条隧道就是一次**确定的** SSH 接入（用户名 / 地址 / 端口 /
+///       跳板 / 凭据），多条接入由**应用**持有：应用保存一个有序的隧道列表，启动时
+///       按顺序尝试，本地端口对第三方透明。
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 pub fn now_millis() -> u64 {
     SystemTime::now()
@@ -91,59 +94,53 @@ impl JumpHost {
     }
 }
 
-/// 一条 SSH 线路：如何到达同一台 SSH 服务器（用户名 / 地址 / 端口 / 跳板 / 凭据）。
+/// 一次确定的 SSH 接入：用户名 / 地址 / 端口 / 跳板链 / 凭据。
 ///
-/// 一条隧道可以配置多条线路，让同一个应用在**本地端口不变**的前提下，按场景切换
-/// SSH 入口（家里走局域网，外出走 frp 之类）。选路由连接时决定，应用配置完全无感。
+/// 一个隧道**只描述一条接入路径**，不再持有可选线路；同一服务需要多个入口时，
+/// 由应用持有多个隧道并按顺序尝试，本地端口不变。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct TunnelEndpoint {
+pub struct TunnelConfig {
     pub id: String,
-    pub label: String,
+    pub name: String,
     pub host: String,
     pub port: u16,
     pub username: String,
     pub credentials: SshCredentials,
     pub jumps: Vec<JumpHost>,
-    /// 只在连上局域网（家里的服务器）时才尝试这条线路。
-    pub wifi_only: bool,
-    /// 停用后保留配置，但连接时不会被拨号。
-    pub enabled: bool,
+    pub auto_reconnect: bool,
+    pub keep_alive_seconds: u32,
+    pub connect_timeout_seconds: u32,
+    pub strict_host_key: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
-impl Default for TunnelEndpoint {
+impl Default for TunnelConfig {
     fn default() -> Self {
+        let now = now_millis();
         Self {
             id: new_id(),
-            label: String::new(),
+            name: String::new(),
             host: String::new(),
             port: DEFAULT_SSH_PORT,
             username: String::new(),
             credentials: SshCredentials::default(),
             jumps: Vec::new(),
-            wifi_only: false,
-            enabled: true,
+            auto_reconnect: true,
+            keep_alive_seconds: DEFAULT_KEEPALIVE_SECONDS,
+            connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            strict_host_key: true,
+            created_at: now,
+            updated_at: now,
         }
     }
 }
 
-impl TunnelEndpoint {
-    /// `user@host:port`，界面上展示线路的稳定标识。
+impl TunnelConfig {
+    /// `user@host:port`，界面上展示隧道身份的稳定标识。
     pub fn endpoint(&self) -> String {
         format!("{}@{}:{}", self.username, self.host, self.port)
-    }
-
-    pub fn display_name(&self) -> &str {
-        let label = self.label.trim();
-        if !label.is_empty() {
-            return label;
-        }
-        let host = self.host.trim();
-        if host.is_empty() {
-            "?"
-        } else {
-            host
-        }
     }
 
     /// 完整链路：从第一级跳板机到最终的 SSH 服务器。
@@ -155,93 +152,11 @@ impl TunnelEndpoint {
 
     /// russh 是否具备发起连接的全部条件。
     pub fn is_dialable(&self) -> bool {
-        self.enabled
-            && !self.host.trim().is_empty()
+        !self.host.trim().is_empty()
             && !self.host.contains(char::is_whitespace)
             && !self.username.trim().is_empty()
             && self.port > 0
             && self.credentials.has_secret()
-    }
-}
-
-/// A reusable SSH access definition: one application-facing name plus the
-/// ordered list of endpoints that can reach the same SSH server.
-///
-/// A tunnel owns no local port and no remote target; applications reference it
-/// and add their own `localPort -> remoteHost:remotePort` rule, so the third
-/// party on the local port never notices which path is carrying the traffic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct TunnelConfig {
-    pub id: String,
-    pub name: String,
-    /// 按尝试顺序排列的线路；第一条是默认线路。
-    pub endpoints: Vec<TunnelEndpoint>,
-    pub auto_reconnect: bool,
-    pub keep_alive_seconds: u32,
-    pub connect_timeout_seconds: u32,
-    pub strict_host_key: bool,
-    /// 用户手工钉住的首选线路；`None` 表示自动选择。
-    pub preferred_endpoint_id: Option<String>,
-    pub created_at: u64,
-    pub updated_at: u64,
-}
-
-impl Default for TunnelConfig {
-    fn default() -> Self {
-        let now = now_millis();
-        Self {
-            id: new_id(),
-            name: String::new(),
-            endpoints: Vec::new(),
-            auto_reconnect: true,
-            keep_alive_seconds: DEFAULT_KEEPALIVE_SECONDS,
-            connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
-            strict_host_key: true,
-            preferred_endpoint_id: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-}
-
-impl TunnelConfig {
-    pub fn endpoint_by_id(&self, id: Option<&str>) -> Option<&TunnelEndpoint> {
-        let wanted = id?;
-        self.endpoints.iter().find(|endpoint| endpoint.id == wanted)
-    }
-
-    /// 尚未连接时界面应该描述的线路：首选线路，否则第一条。
-    pub fn primary_endpoint(&self) -> Option<&TunnelEndpoint> {
-        self.endpoint_by_id(self.preferred_endpoint_id.as_deref())
-            .or_else(|| self.endpoints.first())
-    }
-
-    /// 首选线路的 `user@host:port`，用于卡片与列表。
-    pub fn endpoint(&self) -> String {
-        self.primary_endpoint()
-            .map(TunnelEndpoint::endpoint)
-            .unwrap_or_default()
-    }
-
-    /// 首选线路的完整链路。
-    pub fn chain_summary(&self) -> String {
-        self.primary_endpoint()
-            .map(TunnelEndpoint::chain_summary)
-            .unwrap_or_default()
-    }
-
-    /// 配置完整、可以被拨号的线路，保持声明顺序。
-    pub fn dialable_endpoints(&self) -> Vec<&TunnelEndpoint> {
-        self.endpoints
-            .iter()
-            .filter(|endpoint| endpoint.is_dialable())
-            .collect()
-    }
-
-    /// 定义层面是否还能连上：至少有一条线路带凭据。
-    pub fn is_dialable(&self) -> bool {
-        self.endpoints.iter().any(TunnelEndpoint::is_dialable)
     }
 
     pub fn with_updated_at(mut self) -> Self {
@@ -250,16 +165,18 @@ impl TunnelConfig {
     }
 }
 
-/// One forwarded `localPort -> remoteHost:remotePort` rule. The SSH access
-/// lives in [`TunnelConfig`]; an application only picks one and adds a target.
-/// `desired_on` is the persisted user intent, never live state.
+/// One forwarded `localPort -> remoteHost:remotePort` rule. The SSH access lives
+/// in [`TunnelConfig`]; an application picks one or more tunnels in the order it
+/// wants them dialled. `desired_on` is the persisted user intent, never live
+/// state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ForwardApp {
     pub id: String,
     pub name: String,
     pub group_id: String,
-    pub tunnel_id: String,
+    /// 按尝试顺序排列的隧道 ID；第一条是首选。至少一条。
+    pub tunnel_ids: Vec<String>,
     pub local_port: u16,
     pub remote_host: String,
     pub remote_port: u16,
@@ -277,7 +194,7 @@ impl Default for ForwardApp {
             id: new_id(),
             name: String::new(),
             group_id: DEFAULT_GROUP_ID.to_string(),
-            tunnel_id: String::new(),
+            tunnel_ids: Vec::new(),
             local_port: 18080,
             remote_host: String::new(),
             remote_port: 80,
@@ -291,6 +208,15 @@ impl Default for ForwardApp {
 }
 
 impl ForwardApp {
+    /// 首选隧道（列表第一条）。
+    pub fn primary_tunnel_id(&self) -> Option<&str> {
+        self.tunnel_ids.first().map(String::as_str)
+    }
+
+    pub fn uses_tunnel(&self, tunnel_id: &str) -> bool {
+        self.tunnel_ids.iter().any(|id| id == tunnel_id)
+    }
+
     pub fn resolved_browser_url(&self) -> String {
         let custom = self.browser_url.trim();
         if custom.is_empty() {
@@ -382,55 +308,63 @@ impl DockSnapshot {
     pub fn apps_using_tunnel(&self, tunnel_id: &str) -> Vec<ForwardApp> {
         self.apps
             .iter()
-            .filter(|app| app.tunnel_id == tunnel_id)
+            .filter(|app| app.uses_tunnel(tunnel_id))
             .cloned()
             .collect()
     }
 
-    /// Finds the tunnel (and the endpoint of it) that defines the SSH access of
-    /// a jump host.
+    /// 应用按尝试顺序可以真正拿去拨号的隧道。
+    pub fn dialable_tunnels_for<'a>(&'a self, app: &ForwardApp) -> Vec<&'a TunnelConfig> {
+        app.tunnel_ids
+            .iter()
+            .filter_map(|id| self.tunnel(id))
+            .filter(|tunnel| tunnel.is_dialable())
+            .collect()
+    }
+
+    /// Finds the tunnel that defines the SSH access of a jump host.
     ///
     /// Importing `~/.ssh/config` creates one tunnel per `Host` alias and turns
     /// `ProxyJump` aliases into jump hosts. Those jump hosts carry no secret
     /// (the file has none), yet the same host exists as its own tunnel where the
-    /// user *did* enter the password. Matching the jump back to that endpoint is
+    /// user *did* enter the password. Matching the jump back to that tunnel is
     /// what lets one password serve every tunnel jumping through it.
     ///
     /// The exact `user@host:port` match wins because it identifies the same SSH
-    /// account unambiguously; the alias is the fallback for jump hosts whose
+    /// account unambiguously; the name is the fallback for jump hosts whose
     /// address was edited after the import.
     pub fn credential_source_for_jump<'a>(
         &'a self,
         owner: &TunnelConfig,
         jump: &JumpHost,
-    ) -> Option<&'a TunnelEndpoint> {
+    ) -> Option<&'a TunnelConfig> {
         let owner_id = owner.id.as_str();
         let host = jump.host.trim();
         let username = jump.username.trim();
-        let endpoint_matches = |endpoint: &&TunnelEndpoint| {
+        let exact_match = |tunnel: &&TunnelConfig| {
             !host.is_empty()
-                && endpoint.host.trim().eq_ignore_ascii_case(host)
-                && endpoint.port == jump.port
-                && endpoint.username.trim() == username
-                && endpoint.credentials.has_secret()
+                && tunnel.host.trim().eq_ignore_ascii_case(host)
+                && tunnel.port == jump.port
+                && tunnel.username.trim() == username
+                && tunnel.credentials.has_secret()
         };
         let label = jump.label.trim();
-        let name_matches = |endpoint: &&TunnelEndpoint| {
-            let name = endpoint.display_name();
-            !label.is_empty() && name.trim().eq_ignore_ascii_case(label)
+        let name_matches = |tunnel: &&TunnelConfig| {
+            !label.is_empty() && tunnel.name.trim().eq_ignore_ascii_case(label)
         };
-        // 这些候选都来自“别的隧道”，否则会自己引用自己。
+        // 候选都来自“别的隧道”，否则会自己引用自己。
         let external = || {
             self.tunnels
                 .iter()
                 .filter(|tunnel| tunnel.id != owner_id)
-                .flat_map(|tunnel| tunnel.endpoints.iter())
-                .filter(|endpoint| endpoint.credentials.has_secret())
+                .filter(|tunnel| tunnel.credentials.has_secret())
         };
-        external()
-            .clone()
-            .find(endpoint_matches)
-            .or_else(|| external().find(|endpoint| name_matches(endpoint)))
+        external().clone().find(exact_match).or_else(|| {
+            // 名称匹配也要求同一台主机：只有名字相同、地址不同的隧道不能借用凭据。
+            external().find(|tunnel| {
+                name_matches(tunnel) && tunnel.host.trim().eq_ignore_ascii_case(host)
+            })
+        })
     }
 
     /// 跳板机凭据来自哪条隧道（用于界面提示“凭据复用自…”）。
@@ -439,16 +373,7 @@ impl DockSnapshot {
         owner: &TunnelConfig,
         jump: &JumpHost,
     ) -> Option<String> {
-        let endpoint = self.credential_source_for_jump(owner, jump)?;
-        self.tunnels
-            .iter()
-            .find(|tunnel| {
-                tunnel.id != owner.id
-                    && tunnel
-                        .endpoints
-                        .iter()
-                        .any(|candidate| candidate.id == endpoint.id)
-            })
+        self.credential_source_for_jump(owner, jump)
             .map(|tunnel| tunnel.name.clone())
     }
 
@@ -457,19 +382,17 @@ impl DockSnapshot {
     /// and the UI state, so "已配置密码" always means the same thing.
     pub fn with_inherited_jump_credentials(&self, owner: &TunnelConfig) -> TunnelConfig {
         let mut resolved = owner.clone();
-        for endpoint in &mut resolved.endpoints {
-            let mut inherited: Vec<(usize, SshCredentials)> = Vec::new();
-            for (index, jump) in endpoint.jumps.iter().enumerate() {
-                if jump.credentials.has_secret() {
-                    continue;
-                }
-                if let Some(source) = self.credential_source_for_jump(owner, jump) {
-                    inherited.push((index, source.credentials.clone()));
-                }
+        let mut inherited: Vec<(usize, SshCredentials)> = Vec::new();
+        for (index, jump) in resolved.jumps.iter().enumerate() {
+            if jump.credentials.has_secret() {
+                continue;
             }
-            for (index, credentials) in inherited {
-                endpoint.jumps[index].credentials = credentials;
+            if let Some(source) = self.credential_source_for_jump(owner, jump) {
+                inherited.push((index, source.credentials.clone()));
             }
+        }
+        for (index, credentials) in inherited {
+            resolved.jumps[index].credentials = credentials;
         }
         resolved
     }
@@ -498,6 +421,9 @@ impl DockSnapshot {
             if !group_ids.contains(&app.group_id) {
                 app.group_id = DEFAULT_GROUP_ID.to_string();
             }
+            // 隧道列表本身保持顺序，只去掉重复项，避免同一个入口被拨两次。
+            let mut seen = std::collections::HashSet::new();
+            app.tunnel_ids.retain(|id| seen.insert(id.clone()));
         }
         self.tunnels.sort_by_key(|tunnel| tunnel.created_at);
         self.apps.sort_by_key(|app| app.created_at);
@@ -552,65 +478,28 @@ impl From<&JumpHost> for JumpView {
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EndpointView {
-    pub id: String,
-    pub label: String,
-    pub display_name: String,
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-    pub credentials: CredentialState,
-    pub jumps: Vec<JumpView>,
-    pub wifi_only: bool,
-    pub enabled: bool,
-    /// `user@host:port`，列表里直接展示。
-    pub endpoint: String,
-    pub chain_summary: String,
-    /// 定义完整、当前可以被拨号（启用 + 有地址/用户/凭据）。
-    pub dialable: bool,
-}
-
-impl EndpointView {
-    fn from_resolved(value: &TunnelEndpoint) -> Self {
-        Self {
-            id: value.id.clone(),
-            label: value.label.clone(),
-            display_name: value.display_name().to_string(),
-            host: value.host.clone(),
-            port: value.port,
-            username: value.username.clone(),
-            credentials: CredentialState::from(&value.credentials),
-            jumps: value.jumps.iter().map(JumpView::from).collect(),
-            wifi_only: value.wifi_only,
-            enabled: value.enabled,
-            endpoint: value.endpoint(),
-            chain_summary: value.chain_summary(),
-            dialable: value.is_dialable(),
-        }
-    }
-}
-
 /// Frontend-safe tunnel representation: secrets are reduced to presence flags.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelView {
     pub id: String,
     pub name: String,
-    pub endpoints: Vec<EndpointView>,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub credentials: CredentialState,
+    pub jumps: Vec<JumpView>,
     pub auto_reconnect: bool,
     pub keep_alive_seconds: u32,
     pub connect_timeout_seconds: u32,
     pub strict_host_key: bool,
-    pub preferred_endpoint_id: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
-    /// 首选线路（或第一条）的 `user@host:port`。
+    /// `user@host:port`，列表里直接展示。
     pub endpoint: String,
     pub chain_summary: String,
-    /// 配置了但当前不可拨号的线路数量，卡片据此提示“需补全”。
-    pub dialable_count: usize,
+    /// 定义完整、当前可以被拨号（有地址/用户/端口/凭据）。
+    pub dialable: bool,
 }
 
 impl From<&TunnelConfig> for TunnelView {
@@ -618,21 +507,20 @@ impl From<&TunnelConfig> for TunnelView {
         Self {
             id: value.id.clone(),
             name: value.name.clone(),
-            endpoints: value
-                .endpoints
-                .iter()
-                .map(EndpointView::from_resolved)
-                .collect(),
+            host: value.host.clone(),
+            port: value.port,
+            username: value.username.clone(),
+            credentials: CredentialState::from(&value.credentials),
+            jumps: value.jumps.iter().map(JumpView::from).collect(),
             auto_reconnect: value.auto_reconnect,
             keep_alive_seconds: value.keep_alive_seconds,
             connect_timeout_seconds: value.connect_timeout_seconds,
             strict_host_key: value.strict_host_key,
-            preferred_endpoint_id: value.preferred_endpoint_id.clone(),
             created_at: value.created_at,
             updated_at: value.updated_at,
             endpoint: value.endpoint(),
             chain_summary: value.chain_summary(),
-            dialable_count: value.dialable_endpoints().len(),
+            dialable: value.is_dialable(),
         }
     }
 }
@@ -644,20 +532,15 @@ impl TunnelView {
     pub fn resolved(value: &TunnelConfig, snapshot: &DockSnapshot) -> Self {
         let resolved = snapshot.with_inherited_jump_credentials(value);
         let mut view = TunnelView::from(&resolved);
-        for (endpoint_view, original) in view.endpoints.iter_mut().zip(value.endpoints.iter()) {
-            for (jump_view, original_jump) in
-                endpoint_view.jumps.iter_mut().zip(original.jumps.iter())
-            {
-                if original_jump.credentials.has_secret() {
-                    continue;
-                }
-                let effective = &jump_view.credentials;
-                if !(effective.has_password || effective.has_private_key) {
-                    continue;
-                }
-                jump_view.inherited_from =
-                    snapshot.credential_source_name_for_jump(value, original_jump);
+        for (jump_view, original) in view.jumps.iter_mut().zip(value.jumps.iter()) {
+            if original.credentials.has_secret() {
+                continue;
             }
+            let effective = &jump_view.credentials;
+            if !(effective.has_password || effective.has_private_key) {
+                continue;
+            }
+            jump_view.inherited_from = snapshot.credential_source_name_for_jump(value, original);
         }
         view
     }
@@ -669,7 +552,8 @@ pub struct AppView {
     pub id: String,
     pub name: String,
     pub group_id: String,
-    pub tunnel_id: String,
+    /// 按尝试顺序排列的隧道 ID，第一条是首选。
+    pub tunnel_ids: Vec<String>,
     pub local_port: u16,
     pub remote_host: String,
     pub remote_port: u16,
@@ -688,7 +572,7 @@ impl From<&ForwardApp> for AppView {
             id: value.id.clone(),
             name: value.name.clone(),
             group_id: value.group_id.clone(),
-            tunnel_id: value.tunnel_id.clone(),
+            tunnel_ids: value.tunnel_ids.clone(),
             local_port: value.local_port,
             remote_host: value.remote_host.clone(),
             remote_port: value.remote_port,
@@ -772,38 +656,38 @@ impl AppBlockReason {
     }
 }
 
-/// 某一轮连接里，一条线路为什么没能建立连接。
+/// 某一轮连接里，一个隧道为什么没能建立连接。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EndpointFailure {
-    pub endpoint_id: String,
-    pub label: String,
+pub struct TunnelFailure {
+    pub tunnel_id: String,
+    pub name: String,
     /// 语言无关的错误码，文案由界面提供。
     pub code: String,
     pub detail: Option<String>,
 }
 
-/// 当前正在承载流量的线路，让卡片、错误详情页都能说清“走的是哪条路”。
+/// 当前正在承载流量的隧道，让卡片、错误详情页都能说清“走的是哪条路”。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EndpointSelection {
-    pub endpoint_id: String,
-    pub label: String,
+pub struct TunnelSelection {
+    pub tunnel_id: String,
+    pub name: String,
     pub endpoint: String,
 }
 
-impl EndpointSelection {
-    pub fn of(endpoint: &TunnelEndpoint) -> Self {
+impl TunnelSelection {
+    pub fn of(tunnel: &TunnelConfig) -> Self {
         Self {
-            endpoint_id: endpoint.id.clone(),
-            label: endpoint.display_name().to_string(),
-            endpoint: endpoint.endpoint(),
+            tunnel_id: tunnel.id.clone(),
+            name: tunnel.name.clone(),
+            endpoint: tunnel.endpoint(),
         }
     }
 }
 
 /// Live state of one forwarded application. Each application owns its own SSH
-/// connection and local listener; a shared tunnel is only shared config.
+/// connection and local listener; shared tunnels are only configuration.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStatus {
@@ -817,10 +701,10 @@ pub struct AppStatus {
     pub error_code: Option<String>,
     pub error_detail: Option<String>,
     pub security_alert: bool,
-    /// 当前（或最后一次尝试）承载转发的线路。
-    pub endpoint: Option<EndpointSelection>,
-    /// 本轮已经失败的线路，按尝试顺序。
-    pub endpoint_failures: Vec<EndpointFailure>,
+    /// 当前（或最后一次尝试）承载转发的隧道。
+    pub tunnel: Option<TunnelSelection>,
+    /// 本轮已经失败的隧道，按尝试顺序。
+    pub tunnel_failures: Vec<TunnelFailure>,
     pub updated_at: u64,
 }
 
@@ -837,8 +721,8 @@ impl AppStatus {
             error_code: None,
             error_detail: None,
             security_alert: false,
-            endpoint: None,
-            endpoint_failures: Vec::new(),
+            tunnel: None,
+            tunnel_failures: Vec::new(),
             updated_at: now_millis(),
         }
     }
@@ -911,14 +795,14 @@ impl AppStatus {
         }
     }
 
-    /// 记录本轮选了哪条线路、哪些线路已经失败。
-    pub fn with_endpoint_route(
+    /// 记录本轮选了哪条隧道、哪些隧道已经失败。
+    pub fn with_tunnel_route(
         mut self,
-        endpoint: Option<EndpointSelection>,
-        failures: Vec<EndpointFailure>,
+        tunnel: Option<TunnelSelection>,
+        failures: Vec<TunnelFailure>,
     ) -> Self {
-        self.endpoint = endpoint;
-        self.endpoint_failures = failures;
+        self.tunnel = tunnel;
+        self.tunnel_failures = failures;
         self
     }
 }
@@ -931,8 +815,8 @@ pub enum TestState {
 }
 
 /// Result of a user-triggered tunnel connectivity test. The probe authenticates
-/// through the full jump chain but installs no local forward. Multiple endpoints
-/// are tried in policy order; every failure is reported when none works.
+/// through the full jump chain but installs no local forward: a tunnel now
+/// describes exactly one SSH access, so there is nothing to fall back to.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelTestResult {
@@ -942,10 +826,6 @@ pub struct TunnelTestResult {
     pub error_code: Option<String>,
     pub error_detail: Option<String>,
     pub security_alert: bool,
-    /// 测试成功的线路名。
-    pub endpoint_label: Option<String>,
-    /// 逐条线路的失败原因。
-    pub endpoint_failures: Vec<EndpointFailure>,
 }
 
 fn default_true() -> bool {
@@ -1012,42 +892,20 @@ impl Default for JumpInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct EndpointInput {
-    pub id: Option<String>,
-    pub label: String,
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-    pub credentials: CredentialInput,
-    pub jumps: Vec<JumpInput>,
-    pub wifi_only: bool,
-    pub enabled: bool,
-}
-
-impl Default for EndpointInput {
-    fn default() -> Self {
-        Self {
-            id: None,
-            label: String::new(),
-            host: String::new(),
-            port: DEFAULT_SSH_PORT,
-            username: String::new(),
-            credentials: CredentialInput::default(),
-            jumps: Vec::new(),
-            wifi_only: false,
-            enabled: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelInput {
     pub id: Option<String>,
     pub name: String,
     #[serde(default)]
-    pub endpoints: Vec<EndpointInput>,
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub credentials: CredentialInput,
+    #[serde(default)]
+    pub jumps: Vec<JumpInput>,
     #[serde(default = "default_true")]
     pub auto_reconnect: bool,
     #[serde(default = "default_keepalive")]
@@ -1056,9 +914,10 @@ pub struct TunnelInput {
     pub connect_timeout_seconds: u32,
     #[serde(default = "default_true")]
     pub strict_host_key: bool,
-    /// 首选线路；`None` 表示自动（按声明顺序）。
-    #[serde(default)]
-    pub preferred_endpoint_id: Option<String>,
+}
+
+fn default_ssh_port() -> u16 {
+    DEFAULT_SSH_PORT
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1068,7 +927,9 @@ pub struct AppInput {
     pub name: String,
     #[serde(default = "default_group_id")]
     pub group_id: String,
-    pub tunnel_id: String,
+    /// 按尝试顺序排列的隧道；第一条是首选。
+    #[serde(default)]
+    pub tunnel_ids: Vec<String>,
     pub local_port: u16,
     pub remote_host: String,
     pub remote_port: u16,
@@ -1089,27 +950,21 @@ pub struct GroupInput {
 mod tests {
     use super::*;
 
-    /// 一条直连线路（无跳板）。
-    fn endpoint(host: &str) -> TunnelEndpoint {
-        TunnelEndpoint {
-            host: host.into(),
-            username: "ops".into(),
-            credentials: SshCredentials {
-                auth_type: AuthType::Password,
-                password_cipher: Some("v1.iv.data".into()),
-                ..SshCredentials::default()
-            },
-            ..TunnelEndpoint::default()
+    fn credentials() -> SshCredentials {
+        SshCredentials {
+            auth_type: AuthType::Password,
+            password_cipher: Some("v1.iv.data".into()),
+            ..SshCredentials::default()
         }
     }
 
-    fn tunnel() -> TunnelConfig {
+    fn tunnel(host: &str) -> TunnelConfig {
         TunnelConfig {
             name: "NAS".into(),
-            endpoints: vec![TunnelEndpoint {
-                port: 2222,
-                ..endpoint("example.com")
-            }],
+            host: host.into(),
+            username: "ops".into(),
+            port: 2222,
+            credentials: credentials(),
             ..TunnelConfig::default()
         }
     }
@@ -1117,7 +972,7 @@ mod tests {
     fn app() -> ForwardApp {
         ForwardApp {
             name: "Web".into(),
-            tunnel_id: "t1".into(),
+            tunnel_ids: vec!["t1".into()],
             local_port: 18080,
             remote_host: "10.0.0.5".into(),
             remote_port: 5000,
@@ -1146,23 +1001,17 @@ mod tests {
     #[test]
     fn chain_summary_lists_jumps_before_target() {
         let cfg = TunnelConfig {
-            endpoints: vec![TunnelEndpoint {
-                jumps: vec![
-                    JumpHost {
-                        host: "bastion-1".into(),
-                        ..JumpHost::default()
-                    },
-                    JumpHost {
-                        host: "bastion-2".into(),
-                        ..JumpHost::default()
-                    },
-                ],
-                ..TunnelEndpoint {
-                    port: 2222,
-                    ..endpoint("example.com")
-                }
-            }],
-            ..tunnel()
+            jumps: vec![
+                JumpHost {
+                    host: "bastion-1".into(),
+                    ..JumpHost::default()
+                },
+                JumpHost {
+                    host: "bastion-2".into(),
+                    ..JumpHost::default()
+                },
+            ],
+            ..tunnel("example.com")
         };
         assert_eq!(
             cfg.chain_summary(),
@@ -1171,83 +1020,39 @@ mod tests {
         assert_eq!(cfg.endpoint(), "ops@example.com:2222");
     }
 
-    /// 首选线路决定卡片显示哪一条，但不会改变声明顺序。
+    /// 隧道自己拿不出“首选入口”了：接入是确定的，入口顺序属于应用。
     #[test]
-    fn the_preferred_endpoint_drives_the_card_summary() {
-        let home = TunnelEndpoint {
-            id: "home".into(),
-            label: "家庭局域网".into(),
-            ..endpoint("192.168.1.10")
-        };
-        let away = TunnelEndpoint {
-            id: "away".into(),
-            label: "frp 外网".into(),
-            ..endpoint("frp.example.com")
-        };
-        let pinned = TunnelConfig {
-            endpoints: vec![home.clone(), away.clone()],
-            preferred_endpoint_id: Some("away".into()),
-            ..TunnelConfig::default()
-        };
-        assert_eq!(pinned.endpoint(), "ops@frp.example.com:22");
-        assert_eq!(pinned.primary_endpoint().map(|item| item.id.as_str()), Some("away"));
-        // 首选 id 失效时回落到第一条，不能让卡片变成空白。
-        let stale = TunnelConfig {
-            preferred_endpoint_id: Some("gone".into()),
-            ..pinned
-        };
-        assert_eq!(stale.endpoint(), "ops@192.168.1.10:22");
+    fn a_tunnel_describes_exactly_one_access_path() {
+        let cfg = tunnel("example.com");
+        assert_eq!(cfg.endpoint(), "ops@example.com:2222");
+        assert_eq!(cfg.chain_summary(), "example.com");
+        assert!(cfg.is_dialable());
     }
 
+    /// 地址 / 用户 / 端口 / 凭据任一缺失都不算可拨号。
     #[test]
-    fn endpoint_label_falls_back_to_host_then_placeholder() {
-        let unnamed = TunnelEndpoint {
-            label: String::new(),
-            ..endpoint("bastion.example.com")
-        };
-        assert_eq!(unnamed.display_name(), "bastion.example.com");
-        let empty = TunnelEndpoint {
-            label: "   ".into(),
-            host: String::new(),
-            ..TunnelEndpoint::default()
-        };
-        assert_eq!(empty.display_name(), "?");
-    }
-
-    /// 停用 / 缺凭据 / 地址非法的线路都不算可拨号，界面据此提示“需补全”。
-    #[test]
-    fn dialable_endpoints_require_enabled_address_user_and_secret() {
-        let ok = TunnelEndpoint {
-            id: "ok".into(),
-            ..endpoint("a.example.com")
-        };
-        let off = TunnelEndpoint {
-            id: "off".into(),
-            enabled: false,
-            ..endpoint("b.example.com")
-        };
-        let secretless = TunnelEndpoint {
-            id: "nosecret".into(),
-            credentials: SshCredentials::default(),
-            ..endpoint("c.example.com")
-        };
-        let bad_host = TunnelEndpoint {
-            id: "bad".into(),
-            host: "bad host".into(),
-            ..endpoint("d.example.com")
-        };
-        let config = TunnelConfig {
-            endpoints: vec![ok, off, secretless, bad_host],
-            ..TunnelConfig::default()
-        };
-        let ids: Vec<&str> = config
-            .dialable_endpoints()
-            .iter()
-            .map(|item| item.id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["ok"]);
-        assert!(config.is_dialable());
+    fn a_tunnel_is_dialable_only_when_the_access_is_complete() {
         assert!(!TunnelConfig::default().is_dialable());
+        assert!(!TunnelConfig {
+            credentials: SshCredentials::default(),
+            ..tunnel("a.example.com")
+        }
+        .is_dialable());
+        assert!(!TunnelConfig {
+            host: "bad host".into(),
+            ..tunnel("a.example.com")
+        }
+        .is_dialable());
+        assert!(!TunnelConfig {
+            port: 0,
+            ..tunnel("a.example.com")
+        }
+        .is_dialable());
+        assert!(!TunnelConfig {
+            username: "  ".into(),
+            ..tunnel("a.example.com")
+        }
+        .is_dialable());
     }
 
     #[test]
@@ -1278,6 +1083,21 @@ mod tests {
         assert_eq!(doc.apps[0].group_id, DEFAULT_GROUP_ID);
     }
 
+    /// 隧道列表的顺序就是尝试顺序，归一化只去重、不排序。
+    #[test]
+    fn normalization_dedupes_tunnel_lists_without_reordering() {
+        let doc = DockSnapshot {
+            apps: vec![ForwardApp {
+                tunnel_ids: vec!["away".into(), "home".into(), "away".into()],
+                ..app()
+            }],
+            ..DockSnapshot::default()
+        }
+        .normalized();
+        assert_eq!(doc.apps[0].tunnel_ids, vec!["away", "home"]);
+        assert_eq!(doc.apps[0].primary_tunnel_id(), Some("away"));
+    }
+
     #[test]
     fn blocked_status_exposes_a_stable_error_code() {
         let status = AppStatus::blocked("a1", 18080, AppBlockReason::TunnelDeleted);
@@ -1287,33 +1107,25 @@ mod tests {
     }
 
     #[test]
-    fn status_carries_the_endpoint_that_is_in_use() {
-        let source = endpoint("frp.example.com");
-        let status = AppStatus::connected("a1", 18080).with_endpoint_route(
-            Some(EndpointSelection::of(&source)),
-            vec![EndpointFailure {
-                endpoint_id: "home".into(),
-                label: "家庭局域网".into(),
+    fn status_carries_the_tunnel_that_is_in_use() {
+        let source = tunnel("frp.example.com");
+        let status = AppStatus::connected("a1", 18080).with_tunnel_route(
+            Some(TunnelSelection::of(&source)),
+            vec![TunnelFailure {
+                tunnel_id: "home".into(),
+                name: "家庭局域网".into(),
                 code: "connection_refused".into(),
                 detail: None,
             }],
         );
         assert_eq!(
-            status.endpoint.as_ref().map(|item| item.label.as_str()),
-            Some("frp.example.com")
+            status.tunnel.as_ref().map(|item| item.name.as_str()),
+            Some("NAS")
         );
-        assert_eq!(status.endpoint_failures.len(), 1);
+        assert_eq!(status.tunnel_failures.len(), 1);
         let value = serde_json::to_value(&status).unwrap();
-        assert_eq!(value["endpoint"]["endpoint"], "ops@frp.example.com:22");
-        assert_eq!(value["endpointFailures"][0]["code"], "connection_refused");
-    }
-
-    fn password_credentials() -> SshCredentials {
-        SshCredentials {
-            auth_type: AuthType::Password,
-            password_cipher: Some("v1.iv.data".into()),
-            ..SshCredentials::default()
-        }
+        assert_eq!(value["tunnel"]["endpoint"], "ops@frp.example.com:2222");
+        assert_eq!(value["tunnelFailures"][0]["code"], "connection_refused");
     }
 
     /// Importing `~/.ssh/config` makes the jump host its own tunnel; once that
@@ -1323,30 +1135,24 @@ mod tests {
         let bastion = TunnelConfig {
             id: "bastion".into(),
             name: "dpi-frpc".into(),
-            endpoints: vec![TunnelEndpoint {
-                host: "10.0.0.1".into(),
-                port: 22,
-                username: "root".into(),
-                credentials: password_credentials(),
-                ..TunnelEndpoint::default()
-            }],
+            host: "10.0.0.1".into(),
+            port: 22,
+            username: "root".into(),
+            credentials: credentials(),
             ..TunnelConfig::default()
         };
         let target = TunnelConfig {
             id: "vdi".into(),
             name: "dpi-vdi".into(),
-            endpoints: vec![TunnelEndpoint {
-                host: "10.0.0.2".into(),
+            host: "10.0.0.2".into(),
+            username: "root".into(),
+            jumps: vec![JumpHost {
+                id: "j1".into(),
+                label: "dpi-frpc".into(),
+                host: "10.0.0.1".into(),
+                port: 22,
                 username: "root".into(),
-                jumps: vec![JumpHost {
-                    id: "j1".into(),
-                    label: "dpi-frpc".into(),
-                    host: "10.0.0.1".into(),
-                    port: 22,
-                    username: "root".into(),
-                    credentials: SshCredentials::default(),
-                }],
-                ..TunnelEndpoint::default()
+                credentials: SshCredentials::default(),
             }],
             ..TunnelConfig::default()
         };
@@ -1356,101 +1162,35 @@ mod tests {
         };
 
         let resolved = snapshot.with_inherited_jump_credentials(&target);
-        assert!(resolved.endpoints[0].jumps[0].credentials.has_secret());
+        assert!(resolved.jumps[0].credentials.has_secret());
         assert_eq!(
-            resolved.endpoints[0].jumps[0]
-                .credentials
-                .password_cipher
-                .as_deref(),
+            resolved.jumps[0].credentials.password_cipher.as_deref(),
             Some("v1.iv.data")
         );
         // 原始配置不改写：继承只发生在解析出的副本上。
-        assert!(!target.endpoints[0].jumps[0].credentials.has_secret());
-    }
-
-    /// 每条线路的跳板机都要能各自继承，不能只处理第一条。
-    #[test]
-    fn every_endpoint_inherits_jump_credentials() {
-        let bastion = TunnelConfig {
-            id: "bastion".into(),
-            name: "dpi-frpc".into(),
-            endpoints: vec![TunnelEndpoint {
-                host: "10.0.0.1".into(),
-                port: 22,
-                username: "root".into(),
-                credentials: password_credentials(),
-                ..TunnelEndpoint::default()
-            }],
-            ..TunnelConfig::default()
-        };
-        let jump = || JumpHost {
-            id: "j1".into(),
-            label: String::new(),
-            host: "10.0.0.1".into(),
-            port: 22,
-            username: "root".into(),
-            credentials: SshCredentials::default(),
-        };
-        let target = TunnelConfig {
-            id: "vdi".into(),
-            endpoints: vec![
-                TunnelEndpoint {
-                    id: "home".into(),
-                    host: "10.0.0.2".into(),
-                    username: "root".into(),
-                    jumps: vec![jump()],
-                    ..TunnelEndpoint::default()
-                },
-                TunnelEndpoint {
-                    id: "away".into(),
-                    host: "frp.example.com".into(),
-                    username: "root".into(),
-                    jumps: vec![jump()],
-                    ..TunnelEndpoint::default()
-                },
-            ],
-            ..TunnelConfig::default()
-        };
-        let snapshot = DockSnapshot {
-            tunnels: vec![bastion, target.clone()],
-            ..DockSnapshot::default()
-        };
-        let resolved = snapshot.with_inherited_jump_credentials(&target);
-        for endpoint in &resolved.endpoints {
-            assert!(endpoint.jumps[0].credentials.has_secret());
-        }
-        assert_eq!(
-            snapshot.credential_source_name_for_jump(&target, &target.endpoints[0].jumps[0]),
-            Some("dpi-frpc".to_string())
-        );
+        assert!(!target.jumps[0].credentials.has_secret());
     }
 
     #[test]
-    fn jump_credentials_fall_back_to_endpoint_when_the_label_is_empty() {
+    fn jump_credentials_fall_back_to_the_tunnel_name() {
         let bastion = TunnelConfig {
             id: "bastion".into(),
             name: "已改名".into(),
-            endpoints: vec![TunnelEndpoint {
-                host: "10.0.0.1".into(),
-                port: 2222,
-                username: "ops".into(),
-                credentials: password_credentials(),
-                ..TunnelEndpoint::default()
-            }],
+            host: "10.0.0.1".into(),
+            port: 2222,
+            username: "ops".into(),
+            credentials: credentials(),
             ..TunnelConfig::default()
         };
         let target = TunnelConfig {
             id: "vdi".into(),
-            endpoints: vec![TunnelEndpoint {
-                jumps: vec![JumpHost {
-                    id: "j1".into(),
-                    label: String::new(),
-                    host: "10.0.0.1".into(),
-                    port: 2222,
-                    username: "ops".into(),
-                    credentials: SshCredentials::default(),
-                }],
-                ..TunnelEndpoint::default()
+            jumps: vec![JumpHost {
+                id: "j1".into(),
+                label: "已改名".into(),
+                host: "10.0.0.1".into(),
+                port: 2222,
+                username: "ops".into(),
+                credentials: SshCredentials::default(),
             }],
             ..TunnelConfig::default()
         };
@@ -1458,52 +1198,78 @@ mod tests {
             tunnels: vec![bastion, target.clone()],
             ..DockSnapshot::default()
         };
+        assert_eq!(
+            snapshot.credential_source_name_for_jump(&target, &target.jumps[0]),
+            Some("已改名".to_string())
+        );
         let resolved = snapshot.with_inherited_jump_credentials(&target);
-        assert!(resolved.endpoints[0].jumps[0].credentials.has_secret());
+        assert!(resolved.jumps[0].credentials.has_secret());
+    }
+
+    /// 同名但不同主机的隧道不能借用凭据：名字会变，地址才是身份。
+    #[test]
+    fn a_name_match_with_a_different_host_is_not_a_credential_source() {
+        let other = TunnelConfig {
+            id: "other".into(),
+            name: "堡垒机".into(),
+            host: "198.51.100.7".into(),
+            port: 22,
+            username: "root".into(),
+            credentials: credentials(),
+            ..TunnelConfig::default()
+        };
+        let target = TunnelConfig {
+            id: "vdi".into(),
+            jumps: vec![JumpHost {
+                id: "j1".into(),
+                label: "堡垒机".into(),
+                host: "10.0.0.1".into(),
+                port: 22,
+                username: "root".into(),
+                credentials: SshCredentials::default(),
+            }],
+            ..TunnelConfig::default()
+        };
+        let snapshot = DockSnapshot {
+            tunnels: vec![other, target.clone()],
+            ..DockSnapshot::default()
+        };
+        assert!(snapshot.credential_source_for_jump(&target, &target.jumps[0]).is_none());
     }
 
     #[test]
-    fn an_exact_endpoint_match_beats_a_name_match() {
+    fn an_exact_match_beats_a_name_match() {
         let same_name = TunnelConfig {
             id: "other".into(),
             name: "dpi-frpc".into(),
-            endpoints: vec![TunnelEndpoint {
-                host: "198.51.100.7".into(),
-                port: 22,
-                username: "root".into(),
-                credentials: SshCredentials {
-                    auth_type: AuthType::Password,
-                    password_cipher: Some("v1.wrong.data".into()),
-                    ..SshCredentials::default()
-                },
-                ..TunnelEndpoint::default()
-            }],
+            host: "198.51.100.7".into(),
+            port: 22,
+            username: "root".into(),
+            credentials: SshCredentials {
+                auth_type: AuthType::Password,
+                password_cipher: Some("v1.wrong.data".into()),
+                ..SshCredentials::default()
+            },
             ..TunnelConfig::default()
         };
         let exact = TunnelConfig {
             id: "exact".into(),
             name: "另一个名字".into(),
-            endpoints: vec![TunnelEndpoint {
-                host: "10.0.0.1".into(),
-                port: 22,
-                username: "root".into(),
-                credentials: password_credentials(),
-                ..TunnelEndpoint::default()
-            }],
+            host: "10.0.0.1".into(),
+            port: 22,
+            username: "root".into(),
+            credentials: credentials(),
             ..TunnelConfig::default()
         };
         let target = TunnelConfig {
             id: "vdi".into(),
-            endpoints: vec![TunnelEndpoint {
-                jumps: vec![JumpHost {
-                    id: "j1".into(),
-                    label: "dpi-frpc".into(),
-                    host: "10.0.0.1".into(),
-                    port: 22,
-                    username: "root".into(),
-                    credentials: SshCredentials::default(),
-                }],
-                ..TunnelEndpoint::default()
+            jumps: vec![JumpHost {
+                id: "j1".into(),
+                label: "dpi-frpc".into(),
+                host: "10.0.0.1".into(),
+                port: 22,
+                username: "root".into(),
+                credentials: SshCredentials::default(),
             }],
             ..TunnelConfig::default()
         };
@@ -1513,10 +1279,7 @@ mod tests {
         };
         let resolved = snapshot.with_inherited_jump_credentials(&target);
         assert_eq!(
-            resolved.endpoints[0].jumps[0]
-                .credentials
-                .password_cipher
-                .as_deref(),
+            resolved.jumps[0].credentials.password_cipher.as_deref(),
             Some("v1.iv.data")
         );
     }
@@ -1526,31 +1289,25 @@ mod tests {
         let bastion = TunnelConfig {
             id: "bastion".into(),
             name: "dpi-frpc".into(),
-            endpoints: vec![TunnelEndpoint {
-                host: "10.0.0.1".into(),
-                port: 22,
-                username: "root".into(),
-                credentials: password_credentials(),
-                ..TunnelEndpoint::default()
-            }],
+            host: "10.0.0.1".into(),
+            port: 22,
+            username: "root".into(),
+            credentials: credentials(),
             ..TunnelConfig::default()
         };
         let target = TunnelConfig {
             id: "vdi".into(),
-            endpoints: vec![TunnelEndpoint {
-                jumps: vec![JumpHost {
-                    id: "j1".into(),
-                    label: "dpi-frpc".into(),
-                    host: "10.0.0.1".into(),
-                    port: 22,
-                    username: "root".into(),
-                    credentials: SshCredentials {
-                        auth_type: AuthType::Password,
-                        password_cipher: Some("v1.own.data".into()),
-                        ..SshCredentials::default()
-                    },
-                }],
-                ..TunnelEndpoint::default()
+            jumps: vec![JumpHost {
+                id: "j1".into(),
+                label: "dpi-frpc".into(),
+                host: "10.0.0.1".into(),
+                port: 22,
+                username: "root".into(),
+                credentials: SshCredentials {
+                    auth_type: AuthType::Password,
+                    password_cipher: Some("v1.own.data".into()),
+                    ..SshCredentials::default()
+                },
             }],
             ..TunnelConfig::default()
         };
@@ -1560,10 +1317,7 @@ mod tests {
         };
         let resolved = snapshot.with_inherited_jump_credentials(&target);
         assert_eq!(
-            resolved.endpoints[0].jumps[0]
-                .credentials
-                .password_cipher
-                .as_deref(),
+            resolved.jumps[0].credentials.password_cipher.as_deref(),
             Some("v1.own.data")
         );
     }

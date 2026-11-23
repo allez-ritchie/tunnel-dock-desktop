@@ -2,14 +2,16 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { AppInput, AppView, GroupView, TunnelView } from "../api";
 import { Icon, Modal, WarningBox } from "../components/ui";
 import {
+  MAX_APP_TUNNELS,
   appFormFrom,
+  appHasDialableTunnel,
+  appTunnels,
   signature,
   toAppInput,
   validateApp,
   type AppForm,
   type FormErrors,
 } from "../draft";
-import { tunnelHasDialableEndpoint } from "../status";
 import { strings } from "../strings";
 
 interface Props {
@@ -17,7 +19,7 @@ interface Props {
   tunnels: TunnelView[];
   groups: GroupView[];
   initial: AppView | null;
-  defaults?: { groupId?: string; tunnelId?: string; localPort?: number };
+  defaults?: { groupId?: string; tunnelIds?: string[]; localPort?: number };
   onClose: () => void;
   onSave: (input: AppInput) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
@@ -46,29 +48,59 @@ export function AppEditorScreen({
 
   const editing = initial !== null;
   const dirty = signature(form) !== baseline.current;
-  const selectedTunnel = tunnels.find((tunnel) => tunnel.id === form.tunnelId);
-  const tunnelMissing = editing && initial !== null && !selectedTunnel;
+  const chosen = appTunnels(form, tunnels);
+  const missingChosen =
+    form.tunnelIds.length > chosen.length;
   const duplicatePort = apps.find(
     (app) => app.id !== form.id && app.localPort === Number(form.localPort),
   );
 
   useEffect(() => {
     if (tunnels.length === 0) return;
-    const preferred = defaults?.tunnelId ?? "";
+    const preferred = defaults?.tunnelIds ?? [];
     setForm((current) => {
       if (current.id !== null) return current;
       // A tunnel created from inside this editor comes back as `defaults`;
       // a stale reference (deleted tunnel) falls back to the first tunnel.
-      if (preferred !== "" && current.tunnelId !== preferred) {
-        return { ...current, tunnelId: preferred };
+      const wanted = preferred.filter((id) =>
+        tunnels.some((tunnel) => tunnel.id === id),
+      );
+      if (wanted.length > 0 && wanted.join("|") !== current.tunnelIds.join("|")) {
+        return { ...current, tunnelIds: wanted };
       }
-      if (tunnels.some((tunnel) => tunnel.id === current.tunnelId)) return current;
-      return { ...current, tunnelId: tunnels[0].id };
+      if (current.tunnelIds.length > 0) return current;
+      return { ...current, tunnelIds: [tunnels[0].id] };
     });
-  }, [defaults?.tunnelId, tunnels]);
+  }, [defaults?.tunnelIds, tunnels]);
 
   function patch(update: Partial<AppForm>) {
     setForm((current) => ({ ...current, ...update }));
+  }
+
+  function clearTunnelError() {
+    setErrors(({ tunnelIds: _tunnels, ...rest }) => rest);
+  }
+
+  function addTunnel(id: string) {
+    if (id === "" || form.tunnelIds.includes(id)) return;
+    if (form.tunnelIds.length >= MAX_APP_TUNNELS) {
+      setErrors((current) => ({ ...current, tunnelIds: strings.errorMaxAppTunnels }));
+      return;
+    }
+    patch({ tunnelIds: [...form.tunnelIds, id] });
+    clearTunnelError();
+  }
+
+  function removeTunnel(id: string) {
+    patch({ tunnelIds: form.tunnelIds.filter((item) => item !== id) });
+    clearTunnelError();
+  }
+
+  function moveTunnel(from: number, to: number) {
+    if (to < 0 || to >= form.tunnelIds.length) return;
+    const tunnelIds = [...form.tunnelIds];
+    [tunnelIds[from], tunnelIds[to]] = [tunnelIds[to], tunnelIds[from]];
+    patch({ tunnelIds });
   }
 
   function attemptClose() {
@@ -107,6 +139,9 @@ export function AppEditorScreen({
   const browserPreview = form.browserUrl.trim()
     ? form.browserUrl.replace("{port}", form.localPort || "?")
     : `http://127.0.0.1:${form.localPort || "?"}/`;
+  const available = tunnels.filter(
+    (tunnel) => !form.tunnelIds.includes(tunnel.id),
+  );
 
   return (
     <div className="screen editor-screen">
@@ -123,7 +158,9 @@ export function AppEditorScreen({
         <div className="editor-heading">
           <h1>{editing ? strings.appEditorEdit : strings.appEditorNew}</h1>
           <p className="mono">
-            {selectedTunnel ? selectedTunnel.name : strings.appEditorNoTunnel}
+            {chosen.length > 0
+              ? chosen.map((tunnel) => tunnel.name).join("  →  ")
+              : strings.appEditorNoTunnel}
           </p>
         </div>
       </header>
@@ -145,75 +182,132 @@ export function AppEditorScreen({
             }}
           />
 
-          <div className="field-row">
-            <label
-              className={`field${errors.groupId ? " has-error" : ""}`}
+          <label className={`field${errors.groupId ? " has-error" : ""}`}>
+            <span className="field-label">{strings.appEditorGroup}</span>
+            <select
+              value={form.groupId}
+              onChange={(event) => {
+                patch({ groupId: event.target.value });
+                setErrors(({ groupId: _group, ...rest }) => rest);
+              }}
             >
-              <span className="field-label">{strings.appEditorGroup}</span>
-              <select
-                value={form.groupId}
-                onChange={(event) => {
-                  patch({ groupId: event.target.value });
-                  setErrors(({ groupId: _group, ...rest }) => rest);
-                }}
-              >
-                {groups.map((group) => (
-                  <option key={group.id} value={group.id}>
-                    {group.name}
-                  </option>
-                ))}
-              </select>
-              {errors.groupId ? (
-                <span className="field-error">{errors.groupId}</span>
-              ) : (
-                <span className="field-hint">{strings.appEditorGroupHint}</span>
-              )}
-            </label>
+              {groups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.name}
+                </option>
+              ))}
+            </select>
+            {errors.groupId ? (
+              <span className="field-error">{errors.groupId}</span>
+            ) : (
+              <span className="field-hint">{strings.appEditorGroupHint}</span>
+            )}
+          </label>
+        </FormCard>
 
-            <label
-              className={`field${errors.tunnelId ? " has-error" : ""}`}
-            >
-              <span className="field-label">{strings.appEditorTunnel}</span>
+        <FormCard
+          title={strings.appEditorTunnels}
+          subtitle={strings.appEditorTunnelsHint}
+        >
+          {form.tunnelIds.length === 0 ? (
+            <p className="field-hint warn">{strings.appEditorTunnelEmpty}</p>
+          ) : (
+            <ol className="tunnel-choice-list">
+              {form.tunnelIds.map((id, index) => {
+                const tunnel = tunnels.find((item) => item.id === id);
+                return (
+                  <li
+                    key={id}
+                    className={`tunnel-choice${index === 0 ? " is-preferred" : ""}`}
+                  >
+                    <span className="tunnel-choice-index">{index + 1}</span>
+                    <div className="tunnel-choice-main">
+                      <strong>
+                        {tunnel ? tunnel.name : strings.appEditorTunnelMissing}
+                        {index === 0 ? (
+                          <em className="endpoint-badge">
+                            {strings.appEditorTunnelPreferred}
+                          </em>
+                        ) : null}
+                      </strong>
+                      <span className="mono">
+                        {tunnel
+                          ? `${tunnel.endpoint} · ${tunnel.chainSummary}`
+                          : "—"}
+                      </span>
+                      {tunnel && !tunnel.dialable ? (
+                        <em className="tunnel-choice-warn">
+                          {strings.errorTunnelIncomplete}
+                        </em>
+                      ) : null}
+                    </div>
+                    <div className="tunnel-choice-tools">
+                      <button
+                        type="button"
+                        className="icon-btn sm"
+                        disabled={index === 0}
+                        title={strings.appEditorTunnelSetPreferred}
+                        aria-label={strings.appEditorTunnelSetPreferred}
+                        onClick={() => moveTunnel(index, 0)}
+                      >
+                        <Icon name="star" size={15} />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn sm"
+                        disabled={index === 0}
+                        title={strings.appEditorTunnelMoveUp}
+                        aria-label={strings.appEditorTunnelMoveUp}
+                        onClick={() => moveTunnel(index, index - 1)}
+                      >
+                        <Icon name="chevronUp" size={15} />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn sm"
+                        disabled={index === form.tunnelIds.length - 1}
+                        title={strings.appEditorTunnelMoveDown}
+                        aria-label={strings.appEditorTunnelMoveDown}
+                        onClick={() => moveTunnel(index, index + 1)}
+                      >
+                        <Icon name="chevronDown" size={15} />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn sm danger-icon"
+                        title={strings.appEditorTunnelRemove}
+                        aria-label={strings.appEditorTunnelRemove}
+                        onClick={() => removeTunnel(id)}
+                      >
+                        <Icon name="trash" size={15} />
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+          )}
+
+          <div className="field-row">
+            <label className="field">
+              <span className="field-label">{strings.appEditorTunnelAdd}</span>
               <select
-                value={form.tunnelId}
-                onChange={(event) => {
-                  patch({ tunnelId: event.target.value });
-                  setErrors(({ tunnelId: _tunnel, ...rest }) => rest);
-                }}
+                value=""
+                disabled={available.length === 0}
+                onChange={(event) => addTunnel(event.target.value)}
               >
-                {tunnelMissing ? (
-                  <option value={form.tunnelId}>
-                    {strings.appEditorTunnelMissing}
-                  </option>
-                ) : null}
-                {tunnels.map((tunnel) => (
+                <option value="">
+                  {available.length === 0
+                    ? strings.appEditorTunnelsHint
+                    : strings.appEditorTunnelAdd}
+                </option>
+                {available.map((tunnel) => (
                   <option key={tunnel.id} value={tunnel.id}>
                     {tunnel.name} — {tunnel.endpoint}
-                    {tunnel.endpoints.length > 1
-                      ? `（${strings.tunnelEndpointCount(tunnel.endpoints.length)}）`
-                      : ""}
                   </option>
                 ))}
               </select>
-              {errors.tunnelId ? (
-                <span className="field-error">{errors.tunnelId}</span>
-              ) : tunnelMissing ? (
-                <span className="field-error">
-                  {strings.appEditorTunnelMissing}
-                </span>
-              ) : selectedTunnel && !tunnelHasDialableEndpoint(selectedTunnel) ? (
-                // 隧道存在但一条线路都拨不出去：与其让用户点“启动”后才发现，
-                // 不如在选择隧道时就提示。
-                <span className="field-error">
-                  {strings.endpointNoneDialable}
-                </span>
-              ) : (
-                <span className="field-hint">{strings.appEditorTunnelHint}</span>
-              )}
             </label>
-          </div>
-
-          {tunnelMissing || tunnels.length === 0 ? (
             <button
               type="button"
               className="btn outline sm"
@@ -222,6 +316,23 @@ export function AppEditorScreen({
               <Icon name="plus" size={16} />
               {strings.appEditorCreateTunnel}
             </button>
+          </div>
+
+          {chosen.length > 0 ? (
+            <p className="field-hint">
+              {strings.appEditorTunnelOrderHint(
+                chosen.map((tunnel) => tunnel.name).join("  →  "),
+              )}
+            </p>
+          ) : null}
+          {missingChosen || (editing && form.tunnelIds.length === 0) ? (
+            <p className="field-hint warn">{strings.appEditorTunnelMissing}</p>
+          ) : null}
+          {chosen.length > 0 && !appHasDialableTunnel(form, tunnels) ? (
+            <p className="field-hint warn">{strings.errorNoDialableTunnel}</p>
+          ) : null}
+          {errors.tunnelIds ? (
+            <WarningBox text={errors.tunnelIds} danger />
           ) : null}
         </FormCard>
 

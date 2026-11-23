@@ -3,26 +3,19 @@ import type { AppView, AuthType, TunnelInput, TunnelView } from "../api";
 import { Icon, Modal, SecureNotice, WarningBox } from "../components/ui";
 import { LocalKeyPicker } from "../components/LocalKeyPicker";
 import {
-  MAX_ENDPOINTS,
   MAX_JUMPS,
   chainPreview,
-  duplicateEndpointLabel,
-  endpointChainPreview,
-  endpointError,
-  endpointFormFrom,
   hasSavedPassphrase,
   hasSavedPassword,
   hasSavedPrivateKey,
   jumpError,
   jumpFormFrom,
-  nextEndpointLabel,
   signature,
   toTunnelInput,
   tunnelFormFrom,
   usesInheritedCredentials,
   usesLocalKey,
   validateTunnel,
-  type EndpointForm,
   type FormErrors,
   type JumpForm,
   type TunnelForm,
@@ -47,9 +40,9 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmSave, setConfirmSave] = useState(false);
-  const [endpointEditor, setEndpointEditor] = useState<{
+  const [jumpEditor, setJumpEditor] = useState<{
     index: number;
-    endpoint: EndpointForm;
+    jump: JumpForm;
   } | null>(null);
 
   const editing = initial !== null;
@@ -58,10 +51,6 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
 
   function patch(update: Partial<TunnelForm>) {
     setForm((current) => ({ ...current, ...update }));
-  }
-
-  function clearEndpointsError() {
-    setErrors(({ endpoints: _endpoints, ...rest }) => rest);
   }
 
   function attemptClose() {
@@ -102,45 +91,12 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
     }
   }
 
-  /**
-   * 删掉一条线路。首选线路被删时回落到剩下第一条，否则界面会一直指向一条
-   * 已经不存在的线路。
-   */
-  function removeEndpoint(index: number) {
-    const removed = form.endpoints[index];
-    const endpoints = form.endpoints.filter((_, current) => current !== index);
-    patch({
-      endpoints,
-      preferredEndpointId:
-        form.preferredEndpointId !== null &&
-        removed.id !== null &&
-        form.preferredEndpointId === removed.id
-          ? (endpoints[0]?.id ?? null)
-          : form.preferredEndpointId,
-    });
-    clearEndpointsError();
+  function moveJump(from: number, to: number) {
+    if (to < 0 || to >= form.jumps.length) return;
+    const jumps = [...form.jumps];
+    [jumps[from], jumps[to]] = [jumps[to], jumps[from]];
+    patch({ jumps });
   }
-
-  function moveEndpoint(from: number, to: number) {
-    if (to < 0 || to >= form.endpoints.length) return;
-    const endpoints = [...form.endpoints];
-    [endpoints[from], endpoints[to]] = [endpoints[to], endpoints[from]];
-    patch({ endpoints });
-  }
-
-  function togglePreferred(endpoint: EndpointForm) {
-    if (endpoint.id === null) return;
-    // 再点一次取消钉住，回到“自动选择”。
-    patch({
-      preferredEndpointId:
-        form.preferredEndpointId === endpoint.id ? null : endpoint.id,
-    });
-  }
-
-  const preferredLabel =
-    form.endpoints.find(
-      (endpoint) => endpoint.id !== null && endpoint.id === form.preferredEndpointId,
-    )?.label ?? "";
 
   return (
     <div className="screen editor-screen">
@@ -176,73 +132,233 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
               setErrors(({ name: _name, ...rest }) => rest);
             }}
           />
-          <code className="form-preview">{chainPreview(form)}</code>
         </FormCard>
 
         <FormCard
-          title={strings.endpointSection}
-          subtitle={strings.endpointSectionDesc}
+          title={strings.editorAccessSection}
+          subtitle={strings.editorAccessSectionDesc}
         >
-          {form.endpoints.length === 0 ? (
-            <WarningBox text={strings.endpointEmpty} />
+          <div className="field-row">
+            <Field
+              label={strings.editorSshHost}
+              placeholder={strings.editorSshHostHint}
+              value={form.host}
+              onChange={(value) => {
+                patch({ host: value });
+                setErrors(({ access: _access, ...rest }) => rest);
+              }}
+            />
+            <Field
+              label={strings.editorSshPort}
+              value={form.port}
+              inputMode="numeric"
+              onChange={(value) => {
+                patch({ port: value.replace(/\D/g, "").slice(0, 5) });
+                setErrors(({ access: _access, ...rest }) => rest);
+              }}
+            />
+          </div>
+          <Field
+            label={strings.editorSshUsername}
+            value={form.username}
+            onChange={(value) => {
+              patch({ username: value });
+              setErrors(({ access: _access, ...rest }) => rest);
+            }}
+          />
+
+          <Segmented
+            value={form.authType}
+            onChange={(value) => {
+              patch({ authType: value });
+              setErrors(({ access: _access, ...rest }) => rest);
+            }}
+            options={[
+              { value: "password", label: strings.editorAuthPassword, icon: "key" },
+              { value: "private_key", label: strings.editorAuthKey, icon: "lock" },
+            ]}
+          />
+
+          {form.authType === "password" ? (
+            <div className="secret-block">
+              <Field
+                label={
+                  hasSavedPassword(form)
+                    ? strings.editorPasswordSaved
+                    : strings.editorPassword
+                }
+                placeholder={
+                  hasSavedPassword(form) ? strings.editorSecretKeepHint : undefined
+                }
+                value={form.passwordInput}
+                type="password"
+                onChange={(value) =>
+                  patch({ passwordInput: value, passwordCleared: false })
+                }
+              />
+              {hasSavedPassword(form) ? (
+                <button
+                  type="button"
+                  className="link-danger"
+                  onClick={() =>
+                    patch({ passwordInput: "", passwordCleared: true })
+                  }
+                >
+                  {strings.editorClearSecret}
+                </button>
+              ) : null}
+            </div>
           ) : (
-            <div className="endpoint-list">
-              {form.endpoints.map((endpoint, index) => (
-                <EndpointRow
-                  key={endpoint.id ?? `new-${index}`}
-                  endpoint={endpoint}
-                  index={index}
-                  preferred={
-                    endpoint.id !== null && endpoint.id === form.preferredEndpointId
+            <div className="secret-block">
+              <LocalKeyPicker
+                value={form.privateKeyPath}
+                hasSavedKey={hasSavedPrivateKey(form)}
+                onChange={(name) => patch({ privateKeyPath: name })}
+              />
+              {usesLocalKey(form) ? null : (
+                <Field
+                  label={
+                    hasSavedPrivateKey(form)
+                      ? strings.editorPrivateKeySaved
+                      : strings.editorPrivateKey
                   }
-                  duplicateLabel={duplicateEndpointLabel(form.endpoints, index)}
-                  onEdit={() => setEndpointEditor({ index, endpoint })}
-                  onTogglePreferred={() => togglePreferred(endpoint)}
-                  onMoveUp={index > 0 ? () => moveEndpoint(index, index - 1) : null}
-                  onMoveDown={
-                    index < form.endpoints.length - 1
-                      ? () => moveEndpoint(index, index + 1)
-                      : null
+                  placeholder={
+                    hasSavedPrivateKey(form)
+                      ? strings.editorSecretKeepHint
+                      : strings.editorPrivateKeyHint
                   }
-                  onRemove={() => removeEndpoint(index)}
+                  value={form.privateKeyInput}
+                  multiline
+                  onChange={(value) =>
+                    patch({ privateKeyInput: value, privateKeyCleared: false })
+                  }
                 />
-              ))}
+              )}
+              <Field
+                label={
+                  hasSavedPassphrase(form)
+                    ? `${strings.editorPassphrase} · ${strings.editorPasswordSaved}`
+                    : strings.editorPassphrase
+                }
+                placeholder={
+                  hasSavedPassphrase(form)
+                    ? strings.editorSecretKeepHint
+                    : undefined
+                }
+                value={form.passphraseInput}
+                type="password"
+                onChange={(value) =>
+                  patch({ passphraseInput: value, passphraseCleared: false })
+                }
+              />
+              {hasSavedPrivateKey(form) ? (
+                <button
+                  type="button"
+                  className="link-danger"
+                  onClick={() =>
+                    patch({
+                      privateKeyInput: "",
+                      privateKeyCleared: true,
+                      privateKeyPath: null,
+                      passphraseInput: "",
+                      passphraseCleared: true,
+                    })
+                  }
+                >
+                  {strings.editorClearSecret}
+                </button>
+              ) : null}
             </div>
           )}
 
-          {form.endpoints.length > 0 ? (
-            <p className="field-hint">
-              {strings.endpointCount(form.endpoints.length)}
-              {" · "}
-              {form.preferredEndpointId === null
-                ? strings.endpointPreferredAuto
-                : strings.endpointPreferredOn(preferredLabel)}
-              {" · "}
-              {strings.endpointPreferredAutoHint}
-            </p>
-          ) : null}
+          <SecureNotice text={strings.editorSecretNotice} />
+          {errors.access ? <WarningBox text={errors.access} danger /> : null}
+        </FormCard>
 
-          {errors.endpoints ? (
-            <WarningBox text={errors.endpoints} danger />
-          ) : null}
-
-          <button
-            type="button"
-            className="btn outline sm"
-            disabled={form.endpoints.length >= MAX_ENDPOINTS}
-            onClick={() =>
-              setEndpointEditor({
-                index: -1,
-                endpoint: endpointFormFrom(
-                  undefined,
-                  nextEndpointLabel(form.endpoints.map((item) => item.label)),
-                ),
-              })
-            }
-          >
-            <Icon name="plus" size={16} />
-            {strings.endpointAdd}
-          </button>
+        <FormCard title={strings.editorJumpSection} subtitle={strings.editorJumpHelp}>
+          <div className="jump-list">
+            {form.jumps.length === 0 ? (
+              <p className="muted-row">
+                <Icon name="shield" size={16} />
+                {strings.editorDirect}
+              </p>
+            ) : (
+              form.jumps.map((jump, index) => (
+                <div className="jump-row" key={jump.id ?? `new-${index}`}>
+                  <span className="jump-index">{index + 1}</span>
+                  <button
+                    type="button"
+                    className="jump-main"
+                    onClick={() => setJumpEditor({ index, jump })}
+                  >
+                    <strong>{jump.label || jump.host || "?"}</strong>
+                    <span className="mono">
+                      {jump.username}@{jump.host}:{jump.port}
+                    </span>
+                    {usesInheritedCredentials(jump) ? (
+                      <em className="jump-inherited">
+                        {strings.jumpInherited(jump.inheritedFrom ?? "")}
+                      </em>
+                    ) : null}
+                  </button>
+                  <div className="jump-tools">
+                    <button
+                      type="button"
+                      className="icon-btn sm"
+                      disabled={index === 0}
+                      title={strings.editorJumpMoveUp}
+                      aria-label={strings.editorJumpMoveUp}
+                      onClick={() => moveJump(index, index - 1)}
+                    >
+                      <Icon name="chevronUp" size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn sm"
+                      disabled={index === form.jumps.length - 1}
+                      title={strings.editorJumpMoveDown}
+                      aria-label={strings.editorJumpMoveDown}
+                      onClick={() => moveJump(index, index + 1)}
+                    >
+                      <Icon name="chevronDown" size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn sm"
+                      title={strings.editorJumpEdit}
+                      aria-label={strings.editorJumpEdit}
+                      onClick={() => setJumpEditor({ index, jump })}
+                    >
+                      <Icon name="edit" size={15} />
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn sm danger-icon"
+                      title={strings.editorJumpDelete}
+                      aria-label={strings.editorJumpDelete}
+                      onClick={() =>
+                        patch({
+                          jumps: form.jumps.filter((_, i) => i !== index),
+                        })
+                      }
+                    >
+                      <Icon name="trash" size={15} />
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+            <button
+              type="button"
+              className="btn outline sm"
+              disabled={form.jumps.length >= MAX_JUMPS}
+              onClick={() => setJumpEditor({ index: -1, jump: jumpFormFrom() })}
+            >
+              <Icon name="plus" size={16} />
+              {strings.editorAddJump}
+            </button>
+          </div>
+          <code className="form-preview accent">{chainPreview(form)}</code>
         </FormCard>
 
         <FormCard title={strings.editorAdvanced}>
@@ -316,26 +432,16 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
         </div>
       </footer>
 
-      {endpointEditor ? (
-        <EndpointDialog
-          initial={endpointEditor.endpoint}
-          otherLabels={form.endpoints
-            .filter((_, index) => index !== endpointEditor.index)
-            .map((endpoint) => endpoint.label)}
-          onClose={() => setEndpointEditor(null)}
-          onSave={(endpoint) => {
-            const next = [...form.endpoints];
-            if (endpointEditor.index >= 0) next[endpointEditor.index] = endpoint;
-            else next.push(endpoint);
-            patch({
-              endpoints: next,
-              // 第一条线路自动成为首选，卡片才有东西可展示。
-              preferredEndpointId:
-                form.preferredEndpointId ??
-                (next.length === 1 ? next[0].id : form.preferredEndpointId),
-            });
-            clearEndpointsError();
-            setEndpointEditor(null);
+      {jumpEditor ? (
+        <JumpDialog
+          initial={jumpEditor.jump}
+          onClose={() => setJumpEditor(null)}
+          onSave={(jump) => {
+            const next = [...form.jumps];
+            if (jumpEditor.index >= 0) next[jumpEditor.index] = jump;
+            else next.push(jump);
+            patch({ jumps: next });
+            setJumpEditor(null);
           }}
         />
       ) : null}
@@ -382,119 +488,6 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
           }}
         />
       ) : null}
-    </div>
-  );
-}
-
-/** 隧道编辑器里的一行线路：顺序、首选、徽标与编辑入口。 */
-function EndpointRow({
-  endpoint,
-  index,
-  preferred,
-  duplicateLabel,
-  onEdit,
-  onTogglePreferred,
-  onMoveUp,
-  onMoveDown,
-  onRemove,
-}: {
-  endpoint: EndpointForm;
-  index: number;
-  preferred: boolean;
-  duplicateLabel: boolean;
-  onEdit: () => void;
-  onTogglePreferred: () => void;
-  onMoveUp: (() => void) | null;
-  onMoveDown: (() => void) | null;
-  onRemove: () => void;
-}) {
-  return (
-    <div
-      className={[
-        "endpoint-row",
-        preferred ? "is-preferred" : "",
-        endpoint.enabled ? "" : "is-disabled",
-      ]
-        .filter(Boolean)
-        .join(" ")}
-    >
-      <span className="endpoint-index">{index + 1}</span>
-      <button type="button" className="endpoint-main" onClick={onEdit}>
-        <strong>{endpoint.label || endpoint.host || "?"}</strong>
-        <span className="mono">
-          {endpoint.username}@{endpoint.host}:{endpoint.port}
-        </span>
-        <span className="endpoint-chain">
-          {endpoint.jumps.length === 0
-            ? strings.endpointDirect
-            : strings.endpointJumpCount(endpoint.jumps.length)}
-          {" · "}
-          {endpointChainPreview(endpoint)}
-        </span>
-        {endpoint.wifiOnly ? (
-          <em className="endpoint-badge">{strings.endpointWifiOnlyBadge}</em>
-        ) : null}
-        {endpoint.enabled ? null : (
-          <em className="endpoint-badge is-danger">
-            {strings.endpointDisabledBadge}
-          </em>
-        )}
-        {duplicateLabel ? (
-          <em className="endpoint-badge is-danger">
-            {strings.errorEndpointLabelDuplicate}
-          </em>
-        ) : null}
-      </button>
-      <div className="endpoint-tools">
-        <button
-          type="button"
-          className={`icon-btn sm${preferred ? " is-active" : ""}`}
-          title={strings.endpointPreferred}
-          aria-label={strings.endpointPreferred}
-          aria-pressed={preferred}
-          onClick={onTogglePreferred}
-        >
-          <Icon name="star" size={16} />
-        </button>
-        <button
-          type="button"
-          className="icon-btn sm"
-          disabled={onMoveUp === null}
-          title={strings.endpointMoveUp}
-          aria-label={strings.endpointMoveUp}
-          onClick={onMoveUp ?? undefined}
-        >
-          <Icon name="chevronUp" size={16} />
-        </button>
-        <button
-          type="button"
-          className="icon-btn sm"
-          disabled={onMoveDown === null}
-          title={strings.endpointMoveDown}
-          aria-label={strings.endpointMoveDown}
-          onClick={onMoveDown ?? undefined}
-        >
-          <Icon name="chevronDown" size={16} />
-        </button>
-        <button
-          type="button"
-          className="icon-btn sm"
-          title={strings.endpointEdit}
-          aria-label={strings.endpointEdit}
-          onClick={onEdit}
-        >
-          <Icon name="edit" size={15} />
-        </button>
-        <button
-          type="button"
-          className="icon-btn sm danger-icon"
-          title={strings.endpointDelete}
-          aria-label={strings.endpointDelete}
-          onClick={onRemove}
-        >
-          <Icon name="trash" size={15} />
-        </button>
-      </div>
     </div>
   );
 }
@@ -651,332 +644,6 @@ export function SwitchRow({
   );
 }
 
-/**
- * 单条线路的编辑对话框：地址、凭据、跳板链与“仅局域网 / 启用”开关。
- *
- * 顺序与首选由隧道编辑器负责，这里只编辑一条线路自身，避免对话框里再套一层
- * 排序操作。
- */
-function EndpointDialog({
-  initial,
-  otherLabels,
-  onClose,
-  onSave,
-}: {
-  initial: EndpointForm;
-  otherLabels: string[];
-  onClose: () => void;
-  onSave: (endpoint: EndpointForm) => void;
-}) {
-  const [endpoint, setEndpoint] = useState<EndpointForm>(initial);
-  const [error, setError] = useState<string | null>(null);
-  const [jumpEditor, setJumpEditor] = useState<{
-    index: number;
-    jump: JumpForm;
-  } | null>(null);
-  const isNew = initial.host === "" && initial.id === null;
-
-  function patch(update: Partial<EndpointForm>) {
-    setEndpoint((current) => ({ ...current, ...update }));
-    setError(null);
-  }
-
-  function checkAndSave() {
-    const label = endpoint.label.trim();
-    if (label !== "" && otherLabels.some((item) => item.trim() === label)) {
-      setError(strings.errorEndpointLabelDuplicate);
-      return;
-    }
-    const validation = endpointError(endpoint);
-    if (validation !== null) {
-      setError(validation);
-      return;
-    }
-    onSave(endpoint);
-  }
-
-  return (
-    <Modal
-      title={isNew ? strings.endpointAddTitle : strings.endpointEditTitle}
-      onClose={onClose}
-    >
-      <div className="modal-body">
-        <Field
-          label={strings.endpointLabel}
-          placeholder={strings.endpointLabelHint}
-          value={endpoint.label}
-          onChange={(value) => patch({ label: value })}
-        />
-        <div className="field-row">
-          <Field
-            label={strings.endpointHost}
-            placeholder={strings.endpointHostHint}
-            value={endpoint.host}
-            onChange={(value) => patch({ host: value })}
-          />
-          <Field
-            label={strings.endpointPort}
-            value={endpoint.port}
-            inputMode="numeric"
-            onChange={(value) =>
-              patch({ port: value.replace(/\D/g, "").slice(0, 5) })
-            }
-          />
-        </div>
-        <Field
-          label={strings.endpointUsername}
-          value={endpoint.username}
-          onChange={(value) => patch({ username: value })}
-        />
-
-        <Segmented
-          value={endpoint.authType}
-          onChange={(value) => patch({ authType: value })}
-          options={[
-            { value: "password", label: strings.editorAuthPassword, icon: "key" },
-            { value: "private_key", label: strings.editorAuthKey, icon: "lock" },
-          ]}
-        />
-
-        {endpoint.authType === "password" ? (
-          <div className="secret-block">
-            <Field
-              label={
-                hasSavedPassword(endpoint)
-                  ? strings.editorPasswordSaved
-                  : strings.editorPassword
-              }
-              placeholder={
-                hasSavedPassword(endpoint)
-                  ? strings.editorSecretKeepHint
-                  : undefined
-              }
-              value={endpoint.passwordInput}
-              type="password"
-              onChange={(value) =>
-                patch({ passwordInput: value, passwordCleared: false })
-              }
-            />
-            {hasSavedPassword(endpoint) ? (
-              <button
-                type="button"
-                className="link-danger"
-                onClick={() =>
-                  patch({ passwordInput: "", passwordCleared: true })
-                }
-              >
-                {strings.editorClearSecret}
-              </button>
-            ) : null}
-          </div>
-        ) : (
-          <div className="secret-block">
-            <LocalKeyPicker
-              value={endpoint.privateKeyPath}
-              hasSavedKey={hasSavedPrivateKey(endpoint)}
-              onChange={(name) => patch({ privateKeyPath: name })}
-            />
-            {usesLocalKey(endpoint) ? null : (
-              <Field
-                label={
-                  hasSavedPrivateKey(endpoint)
-                    ? strings.editorPrivateKeySaved
-                    : strings.editorPrivateKey
-                }
-                placeholder={
-                  hasSavedPrivateKey(endpoint)
-                    ? strings.editorSecretKeepHint
-                    : strings.editorPrivateKeyHint
-                }
-                value={endpoint.privateKeyInput}
-                multiline
-                onChange={(value) =>
-                  patch({ privateKeyInput: value, privateKeyCleared: false })
-                }
-              />
-            )}
-            <Field
-              label={
-                hasSavedPassphrase(endpoint)
-                  ? `${strings.editorPassphrase} · ${strings.editorPasswordSaved}`
-                  : strings.editorPassphrase
-              }
-              placeholder={
-                hasSavedPassphrase(endpoint)
-                  ? strings.editorSecretKeepHint
-                  : undefined
-              }
-              value={endpoint.passphraseInput}
-              type="password"
-              onChange={(value) =>
-                patch({ passphraseInput: value, passphraseCleared: false })
-              }
-            />
-            {hasSavedPrivateKey(endpoint) ? (
-              <button
-                type="button"
-                className="link-danger"
-                onClick={() =>
-                  patch({
-                    privateKeyInput: "",
-                    privateKeyCleared: true,
-                    privateKeyPath: null,
-                    passphraseInput: "",
-                    passphraseCleared: true,
-                  })
-                }
-              >
-                {strings.editorClearSecret}
-              </button>
-            ) : null}
-          </div>
-        )}
-
-        <div className="jump-list">
-          <h3 className="form-subtitle">{strings.editorJumpSection}</h3>
-          {endpoint.jumps.length === 0 ? (
-            <p className="muted-row">
-              <Icon name="shield" size={16} />
-              {strings.editorDirect}
-            </p>
-          ) : (
-            endpoint.jumps.map((jump, index) => (
-              <div className="jump-row" key={jump.id ?? `new-${index}`}>
-                <span className="jump-index">{index + 1}</span>
-                <button
-                  type="button"
-                  className="jump-main"
-                  onClick={() => setJumpEditor({ index, jump })}
-                >
-                  <strong>{jump.label || jump.host || "?"}</strong>
-                  <span className="mono">
-                    {jump.username}@{jump.host}:{jump.port}
-                  </span>
-                  {usesInheritedCredentials(jump) ? (
-                    <em className="jump-inherited">
-                      {strings.jumpInherited(jump.inheritedFrom ?? "")}
-                    </em>
-                  ) : null}
-                </button>
-                <div className="jump-tools">
-                  <button
-                    type="button"
-                    className="icon-btn sm"
-                    disabled={index === 0}
-                    title={strings.editorJumpMoveUp}
-                    aria-label={strings.editorJumpMoveUp}
-                    onClick={() => {
-                      const jumps = [...endpoint.jumps];
-                      [jumps[index - 1], jumps[index]] = [
-                        jumps[index],
-                        jumps[index - 1],
-                      ];
-                      patch({ jumps });
-                    }}
-                  >
-                    <Icon name="chevronUp" size={16} />
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-btn sm"
-                    disabled={index === endpoint.jumps.length - 1}
-                    title={strings.editorJumpMoveDown}
-                    aria-label={strings.editorJumpMoveDown}
-                    onClick={() => {
-                      const jumps = [...endpoint.jumps];
-                      [jumps[index + 1], jumps[index]] = [
-                        jumps[index],
-                        jumps[index + 1],
-                      ];
-                      patch({ jumps });
-                    }}
-                  >
-                    <Icon name="chevronDown" size={16} />
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-btn sm"
-                    title={strings.editorJumpEdit}
-                    aria-label={strings.editorJumpEdit}
-                    onClick={() => setJumpEditor({ index, jump })}
-                  >
-                    <Icon name="edit" size={15} />
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-btn sm danger-icon"
-                    title={strings.editorJumpDelete}
-                    aria-label={strings.editorJumpDelete}
-                    onClick={() =>
-                      patch({
-                        jumps: endpoint.jumps.filter((_, i) => i !== index),
-                      })
-                    }
-                  >
-                    <Icon name="trash" size={15} />
-                  </button>
-                </div>
-              </div>
-            ))
-          )}
-          <button
-            type="button"
-            className="btn outline sm"
-            disabled={endpoint.jumps.length >= MAX_JUMPS}
-            onClick={() =>
-              setJumpEditor({ index: -1, jump: jumpFormFrom() })
-            }
-          >
-            <Icon name="plus" size={16} />
-            {strings.editorAddJump}
-          </button>
-          <p className="field-hint">{strings.editorJumpHelp}</p>
-        </div>
-
-        <SwitchRow
-          title={strings.endpointEnabled}
-          subtitle={strings.endpointEnabledDesc}
-          checked={endpoint.enabled}
-          onChange={(value) => patch({ enabled: value })}
-        />
-        <SwitchRow
-          title={strings.endpointWifiOnly}
-          subtitle={strings.endpointWifiOnlyDesc}
-          checked={endpoint.wifiOnly}
-          onChange={(value) => patch({ wifiOnly: value })}
-        />
-
-        <code className="form-preview accent">{endpointChainPreview(endpoint)}</code>
-        <SecureNotice text={strings.editorSecretNotice} />
-        {error ? <WarningBox text={error} danger /> : null}
-      </div>
-      <div className="dialog-actions">
-        <button type="button" className="btn ghost" onClick={onClose}>
-          {strings.dialogCancel}
-        </button>
-        <button type="button" className="btn primary" onClick={checkAndSave}>
-          <Icon name="check" size={16} />
-          {strings.endpointSave}
-        </button>
-      </div>
-
-      {jumpEditor ? (
-        <JumpDialog
-          initial={jumpEditor.jump}
-          onClose={() => setJumpEditor(null)}
-          onSave={(jump) => {
-            const next = [...endpoint.jumps];
-            if (jumpEditor.index >= 0) next[jumpEditor.index] = jump;
-            else next.push(jump);
-            patch({ jumps: next });
-            setJumpEditor(null);
-          }}
-        />
-      ) : null}
-    </Modal>
-  );
-}
-
 function JumpDialog({
   initial,
   onClose,
@@ -1083,9 +750,7 @@ function JumpDialog({
         )}
         <p className="field-hint">{strings.jumpHelp}</p>
         {usesInheritedCredentials(jump) ? (
-          <WarningBox
-            text={strings.jumpInherited(jump.inheritedFrom ?? "")}
-          />
+          <WarningBox text={strings.jumpInherited(jump.inheritedFrom ?? "")} />
         ) : null}
         {error ? <WarningBox text={error} danger /> : null}
       </div>
