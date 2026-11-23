@@ -382,6 +382,7 @@ export default function App() {
       return (
         <TunnelEditorScreen
           initial={initial}
+          tunnels={dock.tunnels}
           usedBy={
             initial
               ? dock.apps.filter((app) => app.tunnelIds.includes(initial.id))

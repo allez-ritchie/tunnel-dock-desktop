@@ -1,5 +1,5 @@
 import { useRef, useState, type ReactNode } from "react";
-import type { AppView, AuthType, TunnelInput, TunnelView } from "../api";
+import type { AppView, TunnelInput, TunnelView } from "../api";
 import { Icon, Modal, SecureNotice, WarningBox } from "../components/ui";
 import { LocalKeyPicker } from "../components/LocalKeyPicker";
 import {
@@ -10,6 +10,10 @@ import {
   hasSavedPrivateKey,
   jumpError,
   jumpFormFrom,
+  jumpFormsFromTunnel,
+  jumpFromTunnel,
+  jumpLevelsAdded,
+  selectableJumpTunnels,
   signature,
   toTunnelInput,
   tunnelFormFrom,
@@ -22,15 +26,26 @@ import {
 } from "../draft";
 import { strings } from "../strings";
 
+type JumpMode = "pick" | "manual";
+
 interface Props {
   initial: TunnelView | null;
+  /** 全部隧道：添加跳板机时可以直接从中挑一台，省去重复填写。 */
+  tunnels: TunnelView[];
   usedBy: AppView[];
   onClose: () => void;
   onSave: (input: TunnelInput) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
 }
 
-export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete }: Props) {
+export function TunnelEditorScreen({
+  initial,
+  tunnels,
+  usedBy,
+  onClose,
+  onSave,
+  onDelete,
+}: Props) {
   const initialForm = useRef(tunnelFormFrom(initial ?? undefined));
   const baseline = useRef(signature(initialForm.current));
   const [form, setForm] = useState<TunnelForm>(initialForm.current);
@@ -291,7 +306,14 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
                     className="jump-main"
                     onClick={() => setJumpEditor({ index, jump })}
                   >
-                    <strong>{jump.label || jump.host || "?"}</strong>
+                    <strong>
+                      {jump.label || jump.host || "?"}
+                      {jumpFromTunnel(jump) ? (
+                        <em className="endpoint-badge">
+                          {strings.jumpFromTunnelBadge}
+                        </em>
+                      ) : null}
+                    </strong>
                     <span className="mono">
                       {jump.username}@{jump.host}:{jump.port}
                     </span>
@@ -435,12 +457,19 @@ export function TunnelEditorScreen({ initial, usedBy, onClose, onSave, onDelete 
       {jumpEditor ? (
         <JumpDialog
           initial={jumpEditor.jump}
+          tunnels={tunnels}
+          editingTunnelId={initial?.id ?? null}
+          existingJumps={form.jumps.filter((_, index) => index !== jumpEditor.index)}
           onClose={() => setJumpEditor(null)}
-          onSave={(jump) => {
+          onSave={(picked) => {
             const next = [...form.jumps];
-            if (jumpEditor.index >= 0) next[jumpEditor.index] = jump;
-            else next.push(jump);
-            patch({ jumps: next });
+            if (jumpEditor.index >= 0) {
+              // 编辑一台已有跳板时只替换它本身，不会带出新的链路。
+              next[jumpEditor.index] = picked[picked.length - 1];
+            } else {
+              next.push(...picked);
+            }
+            patch({ jumps: next.slice(0, MAX_JUMPS) });
             setJumpEditor(null);
           }}
         />
@@ -591,14 +620,14 @@ export function Field({
   );
 }
 
-export function Segmented({
+export function Segmented<T extends string>({
   value,
   onChange,
   options,
 }: {
-  value: AuthType;
-  onChange: (value: AuthType) => void;
-  options: { value: AuthType; label: string; icon: "key" | "lock" }[];
+  value: T;
+  onChange: (value: T) => void;
+  options: { value: T; label: string; icon: "key" | "lock" | "route" | "edit" }[];
 }) {
   return (
     <div className="segmented">
@@ -646,19 +675,45 @@ export function SwitchRow({
 
 function JumpDialog({
   initial,
+  tunnels,
+  editingTunnelId,
+  existingJumps,
   onClose,
   onSave,
 }: {
   initial: JumpForm;
+  tunnels: TunnelView[];
+  editingTunnelId: string | null;
+  existingJumps: JumpForm[];
   onClose: () => void;
-  onSave: (jump: JumpForm) => void;
+  /** 手动填写返回一台；从现有隧道选择时可能带上该隧道自己的跳板链。 */
+  onSave: (jumps: JumpForm[]) => void;
 }) {
-  const [jump, setJump] = useState<JumpForm>(initial);
-  const [error, setError] = useState<string | null>(null);
   const isNew = initial.host === "" && initial.id === null;
+  const pickable = selectableJumpTunnels(tunnels, editingTunnelId, existingJumps);
+  const [mode, setMode] = useState<JumpMode>(
+    isNew && pickable.length > 0 ? "pick" : "manual",
+  );
+  const [jump, setJump] = useState<JumpForm>(initial);
+  const [selectedTunnelId, setSelectedTunnelId] = useState<string | null>(
+    pickable[0]?.id ?? null,
+  );
+  const [error, setError] = useState<string | null>(null);
 
   function patch(update: Partial<JumpForm>) {
     setJump((current) => ({ ...current, ...update }));
+  }
+
+  function applyPick() {
+    const tunnel = pickable.find((item) => item.id === selectedTunnelId);
+    if (!tunnel) return;
+    onSave(jumpFormsFromTunnel(tunnel));
+  }
+
+  function applyManual() {
+    const validation = jumpError(jump);
+    if (validation) setError(validation);
+    else onSave([jump]);
   }
 
   return (
@@ -667,91 +722,152 @@ function JumpDialog({
       onClose={onClose}
     >
       <div className="modal-body">
-        <Field
-          label={strings.jumpLabel}
-          placeholder={strings.jumpLabelHint}
-          value={jump.label}
-          onChange={(value) => patch({ label: value })}
-        />
-        <div className="field-row">
-          <Field
-            label={strings.jumpHost}
-            placeholder={strings.editorSshHostHint}
-            value={jump.host}
-            onChange={(value) => patch({ host: value })}
+        {isNew && tunnels.length > 0 ? (
+          <Segmented
+            value={mode}
+            onChange={(value) => {
+              setMode(value);
+              setError(null);
+            }}
+            options={[
+              { value: "pick", label: strings.jumpModePick, icon: "route" },
+              { value: "manual", label: strings.jumpModeManual, icon: "edit" },
+            ]}
           />
-          <Field
-            label={strings.jumpPort}
-            value={jump.port}
-            inputMode="numeric"
-            onChange={(value) => patch({ port: value.replace(/\D/g, "").slice(0, 5) })}
-          />
-        </div>
-        <Field
-          label={strings.jumpUsername}
-          value={jump.username}
-          onChange={(value) => patch({ username: value })}
-        />
-        <Segmented
-          value={jump.authType}
-          onChange={(value) => patch({ authType: value })}
-          options={[
-            { value: "password", label: strings.editorAuthPassword, icon: "key" },
-            { value: "private_key", label: strings.editorAuthKey, icon: "lock" },
-          ]}
-        />
-        {jump.authType === "password" ? (
-          <Field
-            label={
-              hasSavedPassword(jump) ? strings.jumpPasswordSaved : strings.jumpPassword
-            }
-            placeholder={
-              hasSavedPassword(jump) ? strings.editorSecretKeepHint : undefined
-            }
-            value={jump.passwordInput}
-            type="password"
-            onChange={(value) => patch({ passwordInput: value, passwordCleared: false })}
-          />
+        ) : null}
+
+        {mode === "pick" ? (
+          pickable.length === 0 ? (
+            <p className="field-hint">{strings.jumpPickEmpty}</p>
+          ) : (
+            <>
+              <p className="field-hint">{strings.jumpPickHint}</p>
+              <div className="jump-pick-list">
+                {pickable.map((tunnel) => {
+                  const levels = jumpLevelsAdded(tunnel);
+                  return (
+                    <button
+                      key={tunnel.id}
+                      type="button"
+                      className={`jump-pick${
+                        tunnel.id === selectedTunnelId ? " is-selected" : ""
+                      }`}
+                      onClick={() => {
+                        setSelectedTunnelId(tunnel.id);
+                        setError(null);
+                      }}
+                    >
+                      <span className="jump-pick-main">
+                        <strong>{tunnel.name}</strong>
+                        <span className="mono">{tunnel.endpoint}</span>
+                      </span>
+                      {levels > 1 ? (
+                        <span className="jump-pick-meta">
+                          <em>{strings.jumpPickChain(levels - 1)}</em>
+                        </span>
+                      ) : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )
         ) : (
           <>
-            <LocalKeyPicker
-              value={jump.privateKeyPath}
-              hasSavedKey={hasSavedPrivateKey(jump)}
-              onChange={(name) => patch({ privateKeyPath: name })}
+            <Field
+              label={strings.jumpLabel}
+              placeholder={strings.jumpLabelHint}
+              value={jump.label}
+              onChange={(value) => patch({ label: value })}
             />
-            {usesLocalKey(jump) ? null : (
+            <div className="field-row">
               <Field
-                label={
-                  hasSavedPrivateKey(jump)
-                    ? strings.jumpPrivateKeySaved
-                    : strings.jumpPrivateKey
-                }
-                placeholder={
-                  hasSavedPrivateKey(jump)
-                    ? strings.editorSecretKeepHint
-                    : strings.editorPrivateKeyHint
-                }
-                value={jump.privateKeyInput}
-                multiline
+                label={strings.jumpHost}
+                placeholder={strings.editorSshHostHint}
+                value={jump.host}
+                onChange={(value) => patch({ host: value })}
+              />
+              <Field
+                label={strings.jumpPort}
+                value={jump.port}
+                inputMode="numeric"
                 onChange={(value) =>
-                  patch({ privateKeyInput: value, privateKeyCleared: false })
+                  patch({ port: value.replace(/\D/g, "").slice(0, 5) })
                 }
               />
-            )}
+            </div>
             <Field
-              label={strings.jumpPassphrase}
-              value={jump.passphraseInput}
-              type="password"
-              onChange={(value) =>
-                patch({ passphraseInput: value, passphraseCleared: false })
-              }
+              label={strings.jumpUsername}
+              value={jump.username}
+              onChange={(value) => patch({ username: value })}
             />
+            <Segmented
+              value={jump.authType}
+              onChange={(value) => patch({ authType: value })}
+              options={[
+                { value: "password", label: strings.editorAuthPassword, icon: "key" },
+                { value: "private_key", label: strings.editorAuthKey, icon: "lock" },
+              ]}
+            />
+            {jump.authType === "password" ? (
+              <Field
+                label={
+                  hasSavedPassword(jump)
+                    ? strings.jumpPasswordSaved
+                    : strings.jumpPassword
+                }
+                placeholder={
+                  hasSavedPassword(jump) ? strings.editorSecretKeepHint : undefined
+                }
+                value={jump.passwordInput}
+                type="password"
+                onChange={(value) =>
+                  patch({ passwordInput: value, passwordCleared: false })
+                }
+              />
+            ) : (
+              <>
+                <LocalKeyPicker
+                  value={jump.privateKeyPath}
+                  hasSavedKey={hasSavedPrivateKey(jump)}
+                  onChange={(name) => patch({ privateKeyPath: name })}
+                />
+                {usesLocalKey(jump) ? null : (
+                  <Field
+                    label={
+                      hasSavedPrivateKey(jump)
+                        ? strings.jumpPrivateKeySaved
+                        : strings.jumpPrivateKey
+                    }
+                    placeholder={
+                      hasSavedPrivateKey(jump)
+                        ? strings.editorSecretKeepHint
+                        : strings.editorPrivateKeyHint
+                    }
+                    value={jump.privateKeyInput}
+                    multiline
+                    onChange={(value) =>
+                      patch({ privateKeyInput: value, privateKeyCleared: false })
+                    }
+                  />
+                )}
+                <Field
+                  label={strings.jumpPassphrase}
+                  value={jump.passphraseInput}
+                  type="password"
+                  onChange={(value) =>
+                    patch({ passphraseInput: value, passphraseCleared: false })
+                  }
+                />
+              </>
+            )}
+            <p className="field-hint">{strings.jumpHelp}</p>
+            {usesInheritedCredentials(jump) ? (
+              <WarningBox text={strings.jumpInherited(jump.inheritedFrom ?? "")} />
+            ) : null}
           </>
         )}
-        <p className="field-hint">{strings.jumpHelp}</p>
-        {usesInheritedCredentials(jump) ? (
-          <WarningBox text={strings.jumpInherited(jump.inheritedFrom ?? "")} />
-        ) : null}
+
         {error ? <WarningBox text={error} danger /> : null}
       </div>
       <div className="dialog-actions">
@@ -761,13 +877,10 @@ function JumpDialog({
         <button
           type="button"
           className="btn primary"
-          onClick={() => {
-            const validation = jumpError(jump);
-            if (validation) setError(validation);
-            else onSave(jump);
-          }}
+          disabled={mode === "pick" && pickable.length === 0}
+          onClick={() => (mode === "pick" ? applyPick() : applyManual())}
         >
-          {strings.jumpSave}
+          {mode === "pick" ? strings.jumpPickApply : strings.jumpSave}
         </button>
       </div>
     </Modal>

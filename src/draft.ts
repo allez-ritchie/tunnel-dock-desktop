@@ -3,6 +3,7 @@ import type {
   AppView,
   AuthType,
   GroupView,
+  JumpCredentialSource,
   JumpInput,
   JumpView,
   TunnelInput,
@@ -30,6 +31,21 @@ export interface JumpForm {
   hasPassphrase: boolean;
   /** 凭据来自哪条隧道（`host:port` 与某条隧道相同时自动复用其密码）。 */
   inheritedFrom: string | null;
+  /**
+   * 这条跳板机是从哪条隧道“选”过来的。
+   *
+   * 只用于界面说明与凭据来源提示；保存时仍然落成一份独立的跳板机配置，
+   * 因此被引用的隧道之后被删除也不会影响已经建好的跳板。
+   */
+  sourceTunnelId: string | null;
+  /**
+   * 保存时把哪份凭据密文复制到这条跳板机上。
+   *
+   * `null` 表示不复制（手动填写的跳板，或用同一个 `user@host:port` 由后端
+   * 自动解析的跳板）。从现有隧道选来的跳板会显式带上来源，保证所选隧道
+   * 之后被删除时跳板链仍然可用。
+   */
+  credentialFrom: JumpCredentialSource | null;
 }
 
 /**
@@ -104,7 +120,96 @@ export function jumpFormFrom(jump?: JumpView): JumpForm {
     hasPrivateKey: jump?.credentials.hasPrivateKey ?? false,
     hasPassphrase: jump?.credentials.hasPassphrase ?? false,
     inheritedFrom: jump?.inheritedFrom ?? null,
+    sourceTunnelId: null,
+    credentialFrom: null,
   };
+}
+
+/**
+ * 把一条已有隧道当作跳板机：地址 / 端口 / 用户名 / 认证方式直接沿用，
+ * 凭据不再要求用户重输——保存时由后端把该隧道（或其某级跳板）的密文复制过来。
+ *
+ * 隧道自身的跳板链会按顺序排在这台主机前面：一条隧道的接入路径本来就是
+ * “跳板 → 服务器”，把它当作跳板使用时，整条链路必须一并保留。
+ *
+ * 返回待加入跳板列表的若干项（可能多于 1 项）。
+ */
+export function jumpFormsFromTunnel(tunnel: TunnelView): JumpForm[] {
+  const hops: JumpForm[] = tunnel.jumps.map((jump, index) => ({
+    ...jumpFormFrom(jump),
+    sourceTunnelId: tunnel.id,
+    // 只有这一级自己存了密文才复制。凭据本来就是从另一条隧道继承来的那一级
+    // （`inheritedFrom` 非空）保持不复制，让运行时继续按同一
+    // `user@host:port` 解析，行为与改造前完全一致。
+    credentialFrom:
+      jump.inheritedFrom === null ? { tunnelId: tunnel.id, hop: index } : null,
+  }));
+  hops.push({
+    id: null,
+    label: tunnel.name,
+    host: tunnel.host,
+    port: String(tunnel.port),
+    username: tunnel.username,
+    authType: tunnel.credentials.authType,
+    passwordInput: "",
+    passwordCleared: false,
+    privateKeyInput: "",
+    privateKeyCleared: false,
+    privateKeyPath: null,
+    passphraseInput: "",
+    passphraseCleared: false,
+    hasPassword: tunnel.credentials.hasPassword,
+    hasPrivateKey: tunnel.credentials.hasPrivateKey,
+    hasPassphrase: tunnel.credentials.hasPassphrase,
+    inheritedFrom: null,
+    sourceTunnelId: tunnel.id,
+    credentialFrom: { tunnelId: tunnel.id, hop: null },
+  });
+  return hops;
+}
+
+/** 跳板机是否是从某条隧道选来的（用于界面标注来源）。 */
+export function jumpFromTunnel(jump: JumpForm): boolean {
+  return (jump.sourceTunnelId ?? "").trim() !== "";
+}
+
+/** 两台跳板机是否指向同一个 SSH 账号：`user@host:port`，主机不区分大小写。 */
+export function sameJumpEndpoint(
+  a: { host: string; port: string | number; username: string },
+  b: { host: string; port: string | number; username: string },
+): boolean {
+  return (
+    a.host.trim().toLowerCase() === b.host.trim().toLowerCase() &&
+    String(a.port).trim() === String(b.port).trim() &&
+    a.username.trim() === b.username.trim()
+  );
+}
+
+/**
+ * 可以在“从现有隧道选择”里出现的隧道。
+ *
+ * 排除四类：正在编辑的隧道自己（自己当自己的跳板没有意义）、已经在跳板列表里的
+ * 同一台主机（同一条链路不重复添加）、自身还没有保存凭据的隧道（选过来也用不了）、
+ * 以及接入后会让总级数超过上限的隧道（隧道自带跳板链，选中等于把整条链路搬过来）。
+ */
+export function selectableJumpTunnels(
+  tunnels: TunnelView[],
+  editingTunnelId: string | null,
+  jumps: JumpForm[],
+  limit: number = MAX_JUMPS,
+): TunnelView[] {
+  return tunnels.filter(
+    (tunnel) =>
+      tunnel.id !== editingTunnelId &&
+      (tunnel.credentials.hasPassword || tunnel.credentials.hasPrivateKey) &&
+      !jumps.some((jump) => sameJumpEndpoint(jump, tunnel)) &&
+      jumps.length + jumpFormsFromTunnel(tunnel).length <= limit,
+  );
+}
+
+/** 选中隧道后的链路总级数，用于给用户一个“加几级”的预期。 */
+export function jumpLevelsAdded(tunnel: TunnelView): number {
+  return jumpFormsFromTunnel(tunnel).length;
 }
 
 export function tunnelFormFrom(tunnel?: TunnelView): TunnelForm {
@@ -342,6 +447,8 @@ export function toJumpInput(jump: JumpForm): JumpInput {
     port: Number(jump.port),
     username: jump.username.trim(),
     credentials: credentialInput(jump),
+    // 从现有隧道选来的跳板显式复制密文；手动填写的走原来的合并逻辑。
+    credentialFrom: jump.credentialFrom ?? null,
   };
 }
 

@@ -163,6 +163,18 @@ export interface JumpInput {
   port: number;
   username: string;
   credentials: CredentialInput;
+  /**
+   * 这台跳板机是从哪条已有隧道选来的。后端据此把该隧道的凭据密文复制到跳板机上，
+   * 让跳板机自包含；为 null 时使用 `credentials` 里填写的内容。
+   */
+  credentialFrom?: JumpCredentialSource | null;
+}
+
+export interface JumpCredentialSource {
+  /** 提供凭据的隧道。 */
+  tunnelId: string;
+  /** 该隧道自身跳板链里的第几级；null 表示隧道本身这台主机。 */
+  hop: number | null;
 }
 
 export interface TunnelInput {

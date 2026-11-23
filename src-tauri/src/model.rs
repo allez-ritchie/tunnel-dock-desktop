@@ -377,6 +377,39 @@ impl DockSnapshot {
             .map(|tunnel| tunnel.name.clone())
     }
 
+    /// 用户在编辑器里“从现有隧道选择”了一台跳板机时，把该隧道的凭据密文
+    /// 复制到这台跳板机上，让它不再依赖源隧道。
+    ///
+    /// 与 [`Self::with_inherited_jump_credentials`] 的区别：那是**运行时解析**
+    /// （只读、不落盘），这里是**保存时固化**。用户主动选了“这台主机就是用这个
+    /// 账号密码”，之后删掉源隧道不该把已经建好的跳板链弄断。
+    pub fn apply_jump_credential_source(
+        &self,
+        jump: &mut JumpHost,
+        source: &JumpCredentialSource,
+    ) -> Result<(), String> {
+        let tunnel = self
+            .tunnel(&source.tunnel_id)
+            .ok_or_else(|| "所选的隧道已被删除，请重新选择".to_string())?;
+        let credentials = match source.hop {
+            None => tunnel.credentials.clone(),
+            Some(index) => tunnel
+                .jumps
+                .get(index)
+                .map(|hop| hop.credentials.clone())
+                .ok_or_else(|| format!("隧道“{}”的跳板链已变化，请重新选择", tunnel.name))?,
+        };
+        if !credentials.has_secret() {
+            return Err(format!(
+                "隧道“{}”还没有保存凭据，无法复制给跳板机",
+                tunnel.name
+            ));
+        }
+        // 凭据自带认证方式：选了私钥认证的隧道，跳板机也必须按私钥拨号。
+        jump.credentials = credentials;
+        Ok(())
+    }
+
     /// Returns `owner` with every secret-less jump host taking its credentials
     /// from another tunnel that defines that host. Used by both the connect path
     /// and the UI state, so "已配置密码" always means the same thing.
@@ -867,6 +900,15 @@ impl CredentialInput {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct JumpCredentialSource {
+    /// 提供凭据的隧道。
+    pub tunnel_id: String,
+    /// 该隧道自身跳板链里的第几级；`None` 表示隧道本身这台主机。
+    pub hop: Option<usize>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct JumpInput {
@@ -876,6 +918,9 @@ pub struct JumpInput {
     pub port: u16,
     pub username: String,
     pub credentials: CredentialInput,
+    /// 这台跳板机是从哪条已有隧道“选”来的。保存时把该隧道的凭据密文复制过来，
+    /// 让跳板机保持自包含：源隧道之后被删除也不影响已有的跳板链。
+    pub credential_from: Option<JumpCredentialSource>,
 }
 
 impl Default for JumpInput {
@@ -887,6 +932,7 @@ impl Default for JumpInput {
             port: DEFAULT_SSH_PORT,
             username: String::new(),
             credentials: CredentialInput::default(),
+            credential_from: None,
         }
     }
 }

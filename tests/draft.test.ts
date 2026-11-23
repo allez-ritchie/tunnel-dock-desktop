@@ -15,7 +15,11 @@ import {
   hasSavedPassword,
   jumpError,
   jumpFormFrom,
+  jumpFormsFromTunnel,
+  jumpFromTunnel,
+  jumpLevelsAdded,
   nextPort,
+  selectableJumpTunnels,
   toAppInput,
   toTunnelInput,
   tunnelChainPreview,
@@ -688,5 +692,163 @@ describe("resolveAppStatus with tunnel lists", () => {
       resolveAppStatus(appView({ tunnelIds: [] }), [tunnelView()], groups, {})
         .blockReason,
     ).toBe("tunnel_deleted");
+  });
+});
+
+describe("picking a jump host from an existing tunnel", () => {
+  it("copies address, user and auth from the tunnel", () => {
+    const source = tunnelView({
+      id: "bastion",
+      name: "堡垒机",
+      host: "bastion.example.com",
+      port: 2222,
+      username: "ops",
+      credentials: {
+        authType: "private_key",
+        hasPassword: false,
+        hasPrivateKey: true,
+        hasPassphrase: true,
+      },
+    });
+    const picked = jumpFormsFromTunnel(source);
+    expect(picked).toHaveLength(1);
+    expect(picked[0]).toMatchObject({
+      id: null,
+      label: "堡垒机",
+      host: "bastion.example.com",
+      port: "2222",
+      username: "ops",
+      authType: "private_key",
+      hasPrivateKey: true,
+      hasPassphrase: true,
+      sourceTunnelId: "bastion",
+      credentialFrom: { tunnelId: "bastion", hop: null },
+    });
+    // 不暴露任何密文/明文，只带“已配置”标记。
+    expect(picked[0].passwordInput).toBe("");
+    expect(picked[0].privateKeyInput).toBe("");
+    expect(jumpFromTunnel(picked[0])).toBe(true);
+    // 选过来的跳板本身就是完整的，可以直接保存。
+    expect(jumpError(picked[0])).toBeNull();
+  });
+
+  it("keeps the tunnel's own jump chain in front of it", () => {
+    const source = tunnelView({
+      id: "vdi",
+      name: "内网",
+      host: "10.0.0.2",
+      username: "root",
+      jumps: [
+        {
+          id: "j1",
+          label: "堡垒机",
+          host: "10.0.0.1",
+          port: 22,
+          username: "root",
+          credentials: {
+            authType: "password",
+            hasPassword: true,
+            hasPrivateKey: false,
+            hasPassphrase: false,
+          },
+          inheritedFrom: null,
+        },
+      ],
+    });
+    const picked = jumpFormsFromTunnel(source);
+    expect(picked.map((item) => item.host)).toEqual(["10.0.0.1", "10.0.0.2"]);
+    expect(picked[0].credentialFrom).toEqual({ tunnelId: "vdi", hop: 0 });
+    expect(picked[1].credentialFrom).toEqual({ tunnelId: "vdi", hop: null });
+    expect(jumpLevelsAdded(source)).toBe(2);
+  });
+
+  it("sends the credential source so the backend can copy the secret", () => {
+    const source = tunnelView({ id: "bastion" });
+    const input = toTunnelInput(
+      tunnelForm({ host: "inner", jumps: jumpFormsFromTunnel(source) }),
+    );
+    expect(input.jumps[0].credentialFrom).toEqual({
+      tunnelId: "bastion",
+      hop: null,
+    });
+  });
+
+  it("leaves a manually written jump without a credential source", () => {
+    const input = toTunnelInput(tunnelForm({ host: "inner", jumps: [jump()] }));
+    expect(input.jumps[0].credentialFrom).toBeNull();
+  });
+
+  it("inherited hop credentials stay inherited instead of being copied", () => {
+    const source = tunnelView({
+      jumps: [
+        {
+          id: "j1",
+          label: "堡垒机",
+          host: "10.0.0.1",
+          port: 22,
+          username: "root",
+          // 已由另一条隧道解析出来的凭据：没有自己的密文。
+          credentials: {
+            authType: "password",
+            hasPassword: true,
+            hasPrivateKey: false,
+            hasPassphrase: false,
+          },
+          inheritedFrom: "堡垒机",
+        },
+      ],
+    });
+    const picked = jumpFormsFromTunnel(source);
+    expect(picked[0].credentialFrom).toBeNull();
+    expect(picked[0].sourceTunnelId).toBe(source.id);
+  });
+});
+
+describe("selectableJumpTunnels", () => {
+  it("excludes the tunnel being edited and hosts already in the chain", () => {
+    const editing = tunnelView({ id: "self", host: "self.example.com" });
+    const already = tunnelView({ id: "used", host: "bastion", username: "ops" });
+    const fresh = tunnelView({ id: "fresh", host: "other.example.com" });
+    const jumps = [jump({ host: "bastion", username: "ops" })];
+    const ids = selectableJumpTunnels(
+      [editing, already, fresh],
+      "self",
+      jumps,
+    ).map((tunnel) => tunnel.id);
+    expect(ids).toEqual(["fresh"]);
+  });
+
+  it("hides tunnels without a saved secret", () => {
+    const empty = tunnelView({
+      id: "empty",
+      credentials: {
+        authType: "password",
+        hasPassword: false,
+        hasPrivateKey: false,
+        hasPassphrase: false,
+      },
+    });
+    expect(selectableJumpTunnels([empty], null, [])).toEqual([]);
+  });
+
+  it("hides a tunnel whose own jump chain would exceed the limit", () => {
+    const long = tunnelView({
+      id: "long",
+      jumps: Array.from({ length: MAX_JUMPS }, (_, index) => ({
+        id: `j${index}`,
+        label: "",
+        host: `hop${index}`,
+        port: 22,
+        username: "ops",
+        credentials: {
+          authType: "password" as const,
+          hasPassword: true,
+          hasPrivateKey: false,
+          hasPassphrase: false,
+        },
+        inheritedFrom: null,
+      })),
+    });
+    expect(selectableJumpTunnels([long], null, [])).toEqual([]);
   });
 });

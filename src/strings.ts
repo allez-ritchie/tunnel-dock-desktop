@@ -189,6 +189,17 @@ export const strings = {
   jumpInherited: (source: string) =>
     `凭据复用自隧道“${source}”：同一台主机只需配置一次密码。`,
 
+  // 从现有隧道里挑一台当跳板机，省去重复填写主机 / 端口 / 用户名 / 密码。
+  jumpModePick: "选择现有隧道",
+  jumpModeManual: "手动填写",
+  jumpPickLabel: "从现有隧道选择",
+  jumpPickHint:
+    "选中后自动带出地址、端口、用户名与已保存的凭据，之后仍可改成独立配置。",
+  jumpPickEmpty: "没有可选的隧道，请切换到“手动填写”。",
+  jumpPickChain: (count: number) => `含 ${count} 级既有跳板`,
+  jumpPickApply: "使用该隧道",
+  jumpFromTunnelBadge: "选自隧道",
+
   // ------------------------------------------------------- local ~/.ssh keys
   localKeyUse: "使用 ~/.ssh 中的私钥",
   localKeyPick: "不使用本机私钥（手动粘贴）",

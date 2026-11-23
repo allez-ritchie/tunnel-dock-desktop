@@ -60,7 +60,15 @@ pub async fn save_tunnel(
         Some(id) => state.store.get_tunnel(id).await,
         None => None,
     };
-    let config = build_tunnel(input, existing.as_ref(), &state.secrets, &state.local_ssh)?;
+    // 跳板机可以“从现有隧道选择”，因此保存时要能看到全部隧道。
+    let snapshot = state.store.snapshot().await;
+    let config = build_tunnel(
+        input,
+        existing.as_ref(),
+        &snapshot,
+        &state.secrets,
+        &state.local_ssh,
+    )?;
     let saved = state.runtime.clone().save_tunnel(config).await?;
     crate::sync_autostart(&app).await;
     let snapshot = state.store.snapshot().await;
@@ -566,13 +574,20 @@ fn merge_credentials(
     })
 }
 
+/// 跳板机落盘。
+///
+/// 两条互不影响的来源：
+/// - 手动填写的跳板机按 `credentials` 合并（保持原有的“留空即沿用旧值”语义）；
+/// - 从现有隧道“选”来的跳板机按 `credential_from` 复制源隧道的凭据密文，
+///   落盘后自包含，源隧道被删除也不会断开已有的跳板链。
 fn build_jumps(
     input: &[JumpInput],
     existing: &[JumpHost],
+    snapshot: &DockSnapshot,
     secrets: &Arc<Secrets>,
     local_ssh: &crate::local_ssh::LocalSsh,
 ) -> Result<Vec<JumpHost>, String> {
-    if input.len() > 8 {
+    if input.len() > MAX_JUMPS {
         return Err(format!("最多支持 {MAX_JUMPS} 级跳板机"));
     }
     let mut jumps = Vec::with_capacity(input.len());
@@ -588,28 +603,29 @@ fn build_jumps(
         }
         let id = jump.id.clone().unwrap_or_else(new_id);
         let previous = existing.iter().find(|item| item.id == id);
-        let credentials = match previous {
-            Some(previous) => merge_credentials(
-                &previous.credentials,
-                &jump.credentials,
-                secrets,
-                local_ssh,
-            )?,
-            None => merge_credentials(
-                &SshCredentials::default(),
-                &jump.credentials,
-                secrets,
-                local_ssh,
-            )?,
-        };
-        jumps.push(JumpHost {
+        let mut host = JumpHost {
             id,
             label: jump.label.trim().to_string(),
             host: jump.host.trim().to_string(),
             port: jump.port,
             username: jump.username.trim().to_string(),
-            credentials,
-        });
+            credentials: match previous {
+                Some(previous) => {
+                    merge_credentials(&previous.credentials, &jump.credentials, secrets, local_ssh)?
+                }
+                None => merge_credentials(
+                    &SshCredentials::default(),
+                    &jump.credentials,
+                    secrets,
+                    local_ssh,
+                )?,
+            },
+        };
+        // “从现有隧道选择”的跳板机：把源隧道的凭据密文复制过来（覆盖上面的合并结果）。
+        if let Some(source) = &jump.credential_from {
+            snapshot.apply_jump_credential_source(&mut host, source)?;
+        }
+        jumps.push(host);
     }
     Ok(jumps)
 }
@@ -617,6 +633,7 @@ fn build_jumps(
 fn build_tunnel(
     input: TunnelInput,
     existing: Option<&TunnelConfig>,
+    snapshot: &DockSnapshot,
     secrets: &Arc<Secrets>,
     local_ssh: &crate::local_ssh::LocalSsh,
 ) -> Result<TunnelConfig, String> {
@@ -667,12 +684,10 @@ fn build_tunnel(
         }
         _ => {}
     }
-    let jumps = build_jumps(
-        &input.jumps,
-        existing.map(|config| config.jumps.as_slice()).unwrap_or(&[]),
-        secrets,
-        local_ssh,
-    )?;
+    let previous_jumps = existing
+        .map(|config| config.jumps.as_slice())
+        .unwrap_or(&[]);
+    let jumps = build_jumps(&input.jumps, previous_jumps, snapshot, secrets, local_ssh)?;
 
     let config = TunnelConfig {
         id,
@@ -834,7 +849,29 @@ mod tests {
                 password: Some("s3cret".into()),
                 ..CredentialInput::default()
             },
+            credential_from: None,
         }
+    }
+
+    /// 大多数测试只关心隧道本身，给一个空配置文档即可。
+    fn build(
+        input: TunnelInput,
+        existing: Option<&TunnelConfig>,
+        vault: &Arc<Secrets>,
+        local: &crate::local_ssh::LocalSsh,
+    ) -> Result<TunnelConfig, String> {
+        build_tunnel(input, existing, &DockSnapshot::default(), vault, local)
+    }
+
+    /// 需要“从现有隧道选跳板”这种跨隧道解析时用它。
+    fn build_in(
+        snapshot: &DockSnapshot,
+        input: TunnelInput,
+        existing: Option<&TunnelConfig>,
+        vault: &Arc<Secrets>,
+        local: &crate::local_ssh::LocalSsh,
+    ) -> Result<TunnelConfig, String> {
+        build_tunnel(input, existing, snapshot, vault, local)
     }
 
     /// 测试不依赖真实的 `~/.ssh`，因此始终指向一个空的临时目录。
@@ -848,7 +885,7 @@ mod tests {
     async fn accepts_valid_tunnel_and_encrypts_secret() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let config = build_tunnel(
+        let config = build(
             tunnel_input("NAS", "example.com"),
             None,
             &vault,
@@ -869,7 +906,7 @@ mod tests {
         let vault = Secrets::load(dir.path()).unwrap();
         let mut candidate = tunnel_input("NAS", "example.com");
         candidate.jumps = (0..9).map(jump).collect();
-        let error = build_tunnel(candidate, None, &vault, &local_ssh()).unwrap_err();
+        let error = build(candidate, None, &vault, &local_ssh()).unwrap_err();
         assert!(error.contains("8 级"), "unexpected: {error}");
     }
 
@@ -880,7 +917,7 @@ mod tests {
         let vault = Secrets::load(dir.path()).unwrap();
         let mut input = tunnel_input("外网入口", "frp.example.com");
         input.port = 2222;
-        let config = build_tunnel(input, None, &vault, &local_ssh()).unwrap();
+        let config = build(input, None, &vault, &local_ssh()).unwrap();
         assert_eq!(config.host, "frp.example.com");
         assert_eq!(config.port, 2222);
         assert_eq!(config.endpoint(), "ops@frp.example.com:2222");
@@ -892,14 +929,14 @@ mod tests {
     async fn two_entrances_are_two_tunnels_and_an_app_keeps_their_order() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let home = build_tunnel(
+        let home = build(
             tunnel_input("家里", "192.168.1.10"),
             None,
             &vault,
             &local_ssh(),
         )
         .unwrap();
-        let away = build_tunnel(
+        let away = build(
             tunnel_input("外网", "frp.example.com"),
             None,
             &vault,
@@ -920,7 +957,7 @@ mod tests {
     async fn an_app_needs_at_least_one_tunnel() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let tunnel = build_tunnel(
+        let tunnel = build(
             tunnel_input("NAS", "example.com"),
             None,
             &vault,
@@ -939,9 +976,9 @@ mod tests {
     async fn duplicate_tunnel_choices_collapse_but_keep_the_order() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let a = build_tunnel(tunnel_input("甲", "a.example.com"), None, &vault, &local_ssh())
+        let a = build(tunnel_input("甲", "a.example.com"), None, &vault, &local_ssh())
             .unwrap();
-        let b = build_tunnel(tunnel_input("乙", "b.example.com"), None, &vault, &local_ssh())
+        let b = build(tunnel_input("乙", "b.example.com"), None, &vault, &local_ssh())
             .unwrap();
         let document = snapshot(&[a.clone(), b.clone()]);
         let mut input = app_input(&a.id);
@@ -957,7 +994,7 @@ mod tests {
         let mut tunnels = Vec::new();
         let mut ids = Vec::new();
         for index in 0..=MAX_APP_TUNNELS {
-            let saved = build_tunnel(
+            let saved = build(
                 tunnel_input(&format!("入口 {index}"), &format!("h{index}.example.com")),
                 None,
                 &vault,
@@ -978,7 +1015,7 @@ mod tests {
     async fn a_missing_tunnel_reference_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let tunnel = build_tunnel(
+        let tunnel = build(
             tunnel_input("NAS", "example.com"),
             None,
             &vault,
@@ -998,19 +1035,19 @@ mod tests {
 
         let mut no_host = tunnel_input("NAS", "  ");
         no_host.host = "  ".into();
-        assert!(build_tunnel(no_host, None, &vault, &local_ssh()).is_err());
+        assert!(build(no_host, None, &vault, &local_ssh()).is_err());
 
         let mut no_user = tunnel_input("NAS", "example.com");
         no_user.username = " ".into();
-        assert!(build_tunnel(no_user, None, &vault, &local_ssh()).is_err());
+        assert!(build(no_user, None, &vault, &local_ssh()).is_err());
 
         let mut bad_port = tunnel_input("NAS", "example.com");
         bad_port.port = 0;
-        assert!(build_tunnel(bad_port, None, &vault, &local_ssh()).is_err());
+        assert!(build(bad_port, None, &vault, &local_ssh()).is_err());
 
         let mut no_secret = tunnel_input("NAS", "example.com");
         no_secret.credentials.password = None;
-        let error = build_tunnel(no_secret, None, &vault, &local_ssh()).unwrap_err();
+        let error = build(no_secret, None, &vault, &local_ssh()).unwrap_err();
         assert!(error.contains("密码"), "unexpected: {error}");
     }
 
@@ -1019,7 +1056,7 @@ mod tests {
     async fn editing_keeps_the_tunnel_id_and_stored_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let existing = build_tunnel(
+        let existing = build(
             tunnel_input("NAS", "example.com"),
             None,
             &vault,
@@ -1030,7 +1067,7 @@ mod tests {
         let mut edit = tunnel_input("NAS", "example.com");
         edit.id = Some(existing.id.clone());
         edit.credentials.password = None; // null keeps the stored value
-        let updated = build_tunnel(edit, Some(&existing), &vault, &local_ssh()).unwrap();
+        let updated = build(edit, Some(&existing), &vault, &local_ssh()).unwrap();
         assert_eq!(updated.id, existing.id);
         assert_eq!(
             updated.credentials.password_cipher,
@@ -1042,7 +1079,7 @@ mod tests {
     async fn keeps_stored_secret_when_input_is_null() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let existing = build_tunnel(
+        let existing = build(
             tunnel_input("NAS", "example.com"),
             None,
             &vault,
@@ -1053,7 +1090,7 @@ mod tests {
         let mut edit = tunnel_input("NAS 2", "example.com");
         edit.id = Some(existing.id.clone());
         edit.credentials.password = None; // null keeps the stored value
-        let updated = build_tunnel(edit, Some(&existing), &vault, &local_ssh()).unwrap();
+        let updated = build(edit, Some(&existing), &vault, &local_ssh()).unwrap();
         assert_eq!(updated.name, "NAS 2");
         assert_eq!(
             updated.credentials.password_cipher,
@@ -1065,7 +1102,7 @@ mod tests {
     async fn switching_auth_type_and_clearing_password_drops_the_cipher() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let existing = build_tunnel(
+        let existing = build(
             tunnel_input("NAS", "example.com"),
             None,
             &vault,
@@ -1082,7 +1119,7 @@ mod tests {
             passphrase: None,
             private_key_path: None,
         };
-        let updated = build_tunnel(edit, Some(&existing), &vault, &local_ssh()).unwrap();
+        let updated = build(edit, Some(&existing), &vault, &local_ssh()).unwrap();
         assert_eq!(updated.credentials.auth_type, AuthType::PrivateKey);
         assert!(updated.credentials.password_cipher.is_none());
         assert!(updated.credentials.private_key_cipher.is_some());
@@ -1095,18 +1132,18 @@ mod tests {
 
         let mut short_keepalive = tunnel_input("NAS", "example.com");
         short_keepalive.keep_alive_seconds = 4;
-        assert!(build_tunnel(short_keepalive, None, &vault, &local_ssh()).is_err());
+        assert!(build(short_keepalive, None, &vault, &local_ssh()).is_err());
 
         let mut long_timeout = tunnel_input("NAS", "example.com");
         long_timeout.connect_timeout_seconds = 121;
-        assert!(build_tunnel(long_timeout, None, &vault, &local_ssh()).is_err());
+        assert!(build(long_timeout, None, &vault, &local_ssh()).is_err());
     }
 
     #[tokio::test]
     async fn rejects_names_longer_than_the_limit() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let error = build_tunnel(
+        let error = build(
             tunnel_input(&"名".repeat(41), "example.com"),
             None,
             &vault,
@@ -1120,7 +1157,7 @@ mod tests {
     async fn app_requires_an_existing_group_and_tunnel() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let tunnel = build_tunnel(
+        let tunnel = build(
             tunnel_input("NAS", "example.com"),
             None,
             &vault,
@@ -1146,7 +1183,7 @@ mod tests {
     async fn app_validates_ports_and_browser_url() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let tunnel = build_tunnel(
+        let tunnel = build(
             tunnel_input("NAS", "example.com"),
             None,
             &vault,
@@ -1187,7 +1224,7 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
             private_key_path: Some("id_ed25519".into()),
             ..CredentialInput::default()
         };
-        let config = build_tunnel(input, None, &vault, &local).unwrap();
+        let config = build(input, None, &vault, &local).unwrap();
         let cipher = config.credentials.private_key_cipher.clone().unwrap();
         assert_eq!(vault.decrypt(&cipher).unwrap(), key_body);
         assert!(config.credentials.password_cipher.is_none());
@@ -1203,7 +1240,7 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
             private_key_path: Some("nope".into()),
             ..CredentialInput::default()
         };
-        let error = build_tunnel(input, None, &vault, &local_ssh()).unwrap_err();
+        let error = build(input, None, &vault, &local_ssh()).unwrap_err();
         assert!(error.contains("私钥"), "unexpected: {error}");
     }
 
@@ -1215,11 +1252,129 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
         assert!(check_import_path("missing.zip").is_err());
     }
 
+    /// 从现有隧道里选一台跳板机：保存时把源隧道的凭据密文复制过来，
+    /// 落盘后跳板机自包含——删掉源隧道也不会把已有跳板链弄断。
+    #[tokio::test]
+    async fn a_jump_picked_from_a_tunnel_keeps_its_own_copy_of_the_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let bastion = build(
+            tunnel_input("堡垒机", "bastion.example.com"),
+            None,
+            &vault,
+            &local_ssh(),
+        )
+        .unwrap();
+        let document = snapshot(&[bastion.clone()]);
+
+        let mut input = tunnel_input("内网", "inner.example.com");
+        input.jumps = vec![JumpInput {
+            id: None,
+            label: "堡垒机".into(),
+            host: "bastion.example.com".into(),
+            port: 22,
+            username: "ops".into(),
+            credentials: CredentialInput::default(),
+            credential_from: Some(crate::model::JumpCredentialSource {
+                tunnel_id: bastion.id.clone(),
+                hop: None,
+            }),
+        }];
+        let target = build_in(&document, input, None, &vault, &local_ssh()).unwrap();
+
+        assert_eq!(target.jumps.len(), 1);
+        let cipher = target.jumps[0]
+            .credentials
+            .password_cipher
+            .clone()
+            .expect("跳板机应复制到密码密文");
+        assert_eq!(vault.decrypt(&cipher).unwrap(), "s3cret");
+        // 密文复制而不是引用：源隧道从快照里消失后，跳板机仍然可用。
+        let without_source = DockSnapshot {
+            tunnels: vec![target.clone()],
+            ..DockSnapshot::default()
+        };
+        assert!(without_source.with_inherited_jump_credentials(&target).jumps[0]
+            .credentials
+            .has_secret());
+    }
+
+    #[tokio::test]
+    async fn picking_an_unknown_tunnel_or_a_hop_out_of_range_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let bastion = build(
+            tunnel_input("堡垒机", "bastion.example.com"),
+            None,
+            &vault,
+            &local_ssh(),
+        )
+        .unwrap();
+        let document = snapshot(&[bastion.clone()]);
+
+        let with_source = |source: crate::model::JumpCredentialSource| {
+            let mut input = tunnel_input("内网", "inner.example.com");
+            input.jumps = vec![JumpInput {
+                id: None,
+                label: "堡垒机".into(),
+                host: "bastion.example.com".into(),
+                port: 22,
+                username: "ops".into(),
+                credentials: CredentialInput::default(),
+                credential_from: Some(source),
+            }];
+            input
+        };
+
+        let missing = with_source(crate::model::JumpCredentialSource {
+            tunnel_id: "gone".into(),
+            hop: None,
+        });
+        let error = build_in(&document, missing, None, &vault, &local_ssh()).unwrap_err();
+        assert!(error.contains("已被删除"), "unexpected: {error}");
+
+        let bad_hop = with_source(crate::model::JumpCredentialSource {
+            tunnel_id: bastion.id.clone(),
+            hop: Some(3),
+        });
+        let error = build_in(&document, bad_hop, None, &vault, &local_ssh()).unwrap_err();
+        assert!(error.contains("跳板链"), "unexpected: {error}");
+    }
+
+    /// 手动填写的路径必须保持原样：不传 `credentialFrom` 时不会去读别的隧道。
+    #[tokio::test]
+    async fn a_manual_jump_still_uses_its_own_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Secrets::load(dir.path()).unwrap();
+        let mut input = tunnel_input("内网", "inner.example.com");
+        input.jumps = vec![JumpInput {
+            id: None,
+            label: "手填堡垒机".into(),
+            host: "manual.example.com".into(),
+            port: 2222,
+            username: "ops".into(),
+            credentials: CredentialInput {
+                password: Some("manual-secret".into()),
+                ..CredentialInput::default()
+            },
+            credential_from: None,
+        }];
+        let config = build(
+            input,
+            None,
+            &vault,
+            &local_ssh(),
+        )
+        .unwrap();
+        let cipher = config.jumps[0].credentials.password_cipher.clone().unwrap();
+        assert_eq!(vault.decrypt(&cipher).unwrap(), "manual-secret");
+    }
+
     #[tokio::test]
     async fn app_keeps_desired_and_created_at_on_edit() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let tunnel = build_tunnel(
+        let tunnel = build(
             tunnel_input("NAS", "example.com"),
             None,
             &vault,
