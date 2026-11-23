@@ -15,7 +15,6 @@ import {
 import {
   activeTunnel,
   appUnavailable,
-  primaryTunnel,
   resolveAppStatus,
   usedFallback,
 } from "../status";
@@ -79,17 +78,18 @@ export function AppsScreen({
   const items = apps.map((app) => {
     const group = groupMap.get(app.groupId);
     const status = resolveAppStatus(app, tunnels, groups, statuses);
-    // 首选隧道用来展示“属于哪个服务”，实际在用的隧道由运行状态决定。
-    // 可用性看的是“还有没有一条能用的隧道”：首选被删但备用还在时不该标红。
-    const route = activeTunnel(app, tunnels, status);
-    const tunnel = primaryTunnel(app, tunnels) ?? route;
+    /*
+     * 卡片一律展示“正在用的那条隧道”：首选失败回退到备用后，卡片必须跟着换成
+     * 备用那条，否则用户会以为流量还走在一个已经不通的入口上。
+     * 还没连上时它就是声明顺序里的第一条，也是唯一可展示的候选。
+     */
+    const tunnel = activeTunnel(app, tunnels, status);
     return {
       app,
       tunnel,
-      route,
       group,
       status,
-      unavailable: appUnavailable(route, group, status),
+      unavailable: appUnavailable(tunnel, group, status),
     };
   });
 
@@ -393,10 +393,8 @@ export function AppsScreen({
 
 interface CardItem {
   app: AppView;
-  /** 首选隧道：应用声明的第一条。 */
+  /** 当前承载流量（或即将尝试）的隧道，运行时会随回退切换。 */
   tunnel: TunnelView | undefined;
-  /** 实际承载流量的隧道（运行时决定，可能已回退到后面那条）。 */
-  route: TunnelView | undefined;
   group: GroupView | undefined;
   status: AppStatus;
   unavailable: boolean;
@@ -423,7 +421,7 @@ function AppCard({
   onOpenBrowser: () => void;
   onCopy: () => void;
 }) {
-  const { app, tunnel, route, status, unavailable } = item;
+  const { app, tunnel, status, unavailable } = item;
   const color = unavailable ? "var(--danger)" : phaseColor(status.phase);
   const live = ["connected", "connecting", "reconnecting"].includes(status.phase);
   const fallback = usedFallback(status, app);
@@ -596,18 +594,15 @@ function AppCard({
 
       {/*
        * 走的是哪条隧道：本地端口对第三方透明，但用户自己必须看得见当前入口，
-       * 否则“为什么在家能连、公司不能”无从判断。
+       * 否则“为什么在家能连、公司不能”无从判断。发生回退时合并成一句，
+       * 既说明现在走哪条、也说明为什么不是首选。
        */}
-      {route && app.tunnelIds.length > 1 ? (
+      {tunnel && app.tunnelIds.length > 1 ? (
         <p className={`card-endpoint mono${fallback ? " is-fallback" : ""}`}>
-          <Icon name="route" size={12} />
-          {strings.tunnelInUse(route.name)}
-        </p>
-      ) : null}
-      {fallback && route ? (
-        <p className="card-fallback">
-          <Icon name="swap" size={12} />
-          {strings.appEditorFallbackUsed(route.name)}
+          <Icon name={fallback ? "swap" : "route"} size={12} />
+          {fallback
+            ? strings.tunnelFallbackUsed(tunnel.name)
+            : strings.tunnelInUse(tunnel.name)}
         </p>
       ) : null}
 

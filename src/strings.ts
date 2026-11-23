@@ -296,7 +296,8 @@ export const strings = {
   appEditorTunnelMoveDown: "下移",
   appEditorTunnelRemove: "移除",
   appEditorTunnelOrderHint: (names: string) => `尝试顺序：${names}`,
-  appEditorFallbackUsed: (label: string) =>
+  /** 首选隧道连不上、由备用隧道接管时的提示。 */
+  tunnelFallbackUsed: (label: string) =>
     `首选隧道不可用，已切换到“${label}”`,
   appEditorRouteSection: "转发规则",
   appEditorLocalPort: "本地端口",

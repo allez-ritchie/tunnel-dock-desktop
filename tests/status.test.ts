@@ -261,6 +261,25 @@ describe("usedFallback", () => {
     expect(usedFallback(reconnecting, appTwoTunnels)).toBe(false);
   });
 
+  /*
+   * 回归：卡片必须显示“正在用的那条”。首选失败、备用接管后，如果卡片还停在
+   * 首选隧道上，用户会以为流量走在一个已经不通的入口上。
+   */
+  it("names the fallback tunnel that is actually carrying the traffic", () => {
+    const live = status({
+      phase: "connected",
+      tunnel: { tunnelId: "away", name: "外网", endpoint: "ops@frp.example.com:22" },
+      tunnelFailures: [
+        { tunnelId: "home", name: "家里", code: "connection_refused", detail: null },
+      ],
+    });
+    const tunnels = [home, away];
+    expect(activeTunnel({ tunnelIds: ["home", "away"] }, tunnels, live)?.name).toBe(
+      "外网",
+    );
+    expect(usedFallback(live, { tunnelIds: ["home", "away"] })).toBe(true);
+  });
+
   it("is false for a single-tunnel app (nothing to fall back to)", () => {
     const live = status({
       tunnel: { tunnelId: "other", name: "别的", endpoint: "b" },

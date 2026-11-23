@@ -104,7 +104,7 @@ describe("strings", () => {
   it("summarizes multi-tunnel apps and fallbacks", () => {
     expect(strings.appTunnelCount(2)).toContain("2");
     expect(strings.tunnelInUse("外网入口")).toContain("外网入口");
-    expect(strings.appEditorFallbackUsed("外网入口")).toContain("外网入口");
+    expect(strings.tunnelFallbackUsed("外网入口")).toContain("外网入口");
     expect(strings.tunnelFailureLine("家里", "连接超时")).toContain("连接超时");
     expect(strings.appEditorTunnelOrderHint("外网  →  家里")).toContain("家里");
     expect(strings.tunnelTestOk(120)).toContain("120");

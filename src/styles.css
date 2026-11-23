@@ -862,11 +862,10 @@ button:disabled {
 }
 
 /*
- * 应用卡片上的“当前线路”。回退到下一条线路时换成警示色，因为此时第三方看到的
- * 是一条与预期不同的路径，用户需要知道。
+ * 应用卡片上的“当前隧道”。回退只是换了一条更可用的路，转发本身是正常的，
+ * 因此用成功色而不是报警色——红色会让用户误以为连接出了问题。
  */
-.card-endpoint,
-.card-fallback {
+.card-endpoint {
   display: flex;
   align-items: center;
   gap: 5px;
@@ -879,12 +878,7 @@ button:disabled {
 }
 
 .card-endpoint.is-fallback {
-  color: var(--danger);
-}
-
-.card-fallback {
-  margin-top: 3px;
-  color: var(--danger);
+  color: var(--online);
 }
 
 .card-actions {
