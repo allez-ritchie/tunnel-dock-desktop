@@ -1,0 +1,7 @@
+# 把本地与 CI 的 Rust 工具链固定在同一版本，保证 rustfmt / clippy 的结果一致。
+# 升级步骤：改这里的 channel，同步修改 .github/workflows/ci.yml 与 build.yml 里的
+# toolchain，然后本地执行 cargo fmt --all 并跑一遍 clippy / 测试。
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

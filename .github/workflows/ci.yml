@@ -1,0 +1,74 @@
+name: 校验
+
+# 每次向 main 推送和每个 PR 都跑一遍：前端类型检查 / 构建 / 单元测试，
+# 以及 Rust 的格式、clippy 与测试。发版打包在 build.yml 里，不在这里。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上的新提交会取消尚未结束的旧运行，避免排队浪费时间。
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  frontend:
+    name: 前端（构建 + 单元测试）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+      - name: 安装前端依赖
+        run: npm ci
+      - name: 校验三处版本号一致
+        run: node .github/scripts/check-version.mjs
+      - name: 类型检查 + 生产构建
+        run: npm run build
+      - name: 单元测试
+        run: npm test
+
+  rust:
+    name: Rust（格式 + clippy + 测试）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 安装 Tauri 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            pkg-config \
+            build-essential
+      # 工具链版本与 rust-toolchain.toml 保持一致；固定版本可以让 fmt / clippy 的结果稳定。
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri -> target
+      - name: 格式检查
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - name: clippy（警告视为错误）
+        run: >-
+          cargo clippy --manifest-path src-tauri/Cargo.toml
+          --all-targets --locked -- -D warnings
+      - name: 单元与集成测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked

@@ -1,0 +1,91 @@
+name: 构建安装包
+
+# 打 tag 时完整构建；手动可随时触发；PR 只在改动可能影响打包时构建，
+# 避免每个 PR 都跑两条重量级流水线。产物作为 workflow artifact 上传，
+# 不自动创建 GitHub Release。
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "src-tauri/**"
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+      - "rust-toolchain.toml"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bundle:
+    name: 打包 ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux 用 22.04：产物依赖的 glibc / webkit2gtk 版本更低，能在更多发行版上安装。
+          - name: Linux x86_64
+            os: ubuntu-22.04
+            bundles: deb,rpm,appimage
+            artifact: tunneldock-linux-x86_64
+            paths: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/rpm/*.rpm
+              src-tauri/target/release/bundle/appimage/*.AppImage
+          - name: Windows x86_64
+            os: windows-2025
+            bundles: msi,nsis
+            artifact: tunneldock-windows-x86_64
+            paths: |
+              src-tauri/target/release/bundle/msi/*.msi
+              src-tauri/target/release/bundle/nsis/*.exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+      - name: 安装 Tauri 系统依赖（仅 Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            pkg-config \
+            build-essential \
+            patchelf
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.94.1"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri -> target
+      - name: 安装前端依赖
+        run: npm ci
+      - name: 校验 tag 与版本号一致
+        if: startsWith(github.ref, 'refs/tags/')
+        run: node .github/scripts/check-version.mjs --tag ${{ github.ref_name }}
+      - name: 打包
+        run: npm run tauri build -- --bundles ${{ matrix.bundles }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.paths }}
+          if-no-files-found: error
+          retention-days: 14
