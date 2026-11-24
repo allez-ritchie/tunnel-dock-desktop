@@ -369,7 +369,7 @@ impl Runtime {
             if !app.desired_on && !app.auto_start_on_boot {
                 continue;
             }
-            if blocking_reason(&snapshot, &app).is_some() {
+            if blocking_reason(&snapshot, app).is_some() {
                 continue;
             }
             if !app.desired_on {
@@ -482,7 +482,10 @@ impl Runtime {
                         app.local_port,
                         failure.as_ref().map(|item| item.code.clone()),
                         failure.as_ref().and_then(|item| item.detail.clone()),
-                        last_round.as_ref().map(block_reason_for).unwrap_or(AppBlockReason::None),
+                        last_round
+                            .as_ref()
+                            .map(block_reason_for)
+                            .unwrap_or(AppBlockReason::None),
                     )
                     .with_tunnel_route(
                         last_round.as_ref().and_then(selected_tunnel),
@@ -541,10 +544,7 @@ impl Runtime {
             // 上次成功的隧道优先，但顺序稳定：其余隧道保持应用里的声明顺序。
             let last_good = self.last_good_tunnel(&app_id).await;
             if let Some(last_good) = last_good {
-                if let Some(index) = candidates
-                    .iter()
-                    .position(|tunnel| tunnel.id == last_good)
-                {
+                if let Some(index) = candidates.iter().position(|tunnel| tunnel.id == last_good) {
                     let preferred = candidates.remove(index);
                     candidates.insert(0, preferred);
                 }

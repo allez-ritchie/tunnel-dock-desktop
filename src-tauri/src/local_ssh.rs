@@ -244,7 +244,7 @@ fn detect_key_type(raw: &[u8], dir: &Path, name: &str) -> Option<String> {
 fn public_key_type(path: &Path) -> Option<String> {
     let raw = std::fs::read(path).ok()?;
     let text = String::from_utf8_lossy(&raw);
-    let first = text.trim().split_whitespace().next()?;
+    let first = text.split_whitespace().next()?;
     if first.starts_with("ssh-") || first.starts_with("ecdsa-") || first.starts_with("sk-") {
         Some(first.to_string())
     } else {
@@ -306,8 +306,7 @@ fn extract_pem_body(text: &str) -> Option<String> {
 
 /// 极简 Base64 解码（不接受空白），避免为了读一个 cipher 名引入额外依赖。
 fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
     let mut buffer: u32 = 0;
@@ -458,7 +457,11 @@ fn split_proxy_jump(value: &str) -> Vec<String> {
         .map(|item| {
             let without_user = item.rsplit('@').next().unwrap_or(item);
             let host = match without_user.rfind(':') {
-                Some(index) if without_user[index + 1..].chars().all(|ch| ch.is_ascii_digit()) => {
+                Some(index)
+                    if without_user[index + 1..]
+                        .chars()
+                        .all(|ch| ch.is_ascii_digit()) =>
+                {
                     &without_user[..index]
                 }
                 _ => without_user,

@@ -43,7 +43,11 @@ pub fn no_tunnel_reason(snapshot: &DockSnapshot, app: &ForwardApp) -> NoTunnelRe
     if app.tunnel_ids.is_empty() {
         return NoTunnelReason::NoTunnels;
     }
-    if app.tunnel_ids.iter().all(|id| snapshot.tunnel(id).is_none()) {
+    if app
+        .tunnel_ids
+        .iter()
+        .all(|id| snapshot.tunnel(id).is_none())
+    {
         return NoTunnelReason::TunnelMissing;
     }
     NoTunnelReason::Incomplete

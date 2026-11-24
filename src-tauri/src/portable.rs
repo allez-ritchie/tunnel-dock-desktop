@@ -576,8 +576,8 @@ pub fn write_zip(path: &Path, document: &ExportDocument) -> Result<(), String> {
     writer
         .write_all(README.as_bytes())
         .map_err(|error| format!("无法写入压缩包: {error}"))?;
-    let manifest = serde_json::to_vec_pretty(document)
-        .map_err(|error| format!("无法序列化配置: {error}"))?;
+    let manifest =
+        serde_json::to_vec_pretty(document).map_err(|error| format!("无法序列化配置: {error}"))?;
     writer
         .start_file(MANIFEST_NAME, options)
         .map_err(|error| format!("无法写入压缩包: {error}"))?;
@@ -592,8 +592,8 @@ pub fn write_zip(path: &Path, document: &ExportDocument) -> Result<(), String> {
 
 pub fn read_zip(path: &Path) -> Result<ExportDocument, String> {
     let file = std::fs::File::open(path).map_err(|error| format!("无法读取文件: {error}"))?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|_| "无法识别的压缩包，请选择 TunnelDock 导出的 .zip".to_string())?;
+    let mut archive = ZipArchive::new(file)
+        .map_err(|_| "无法识别的压缩包，请选择 TunnelDock 导出的 .zip".to_string())?;
 
     let mut manifest: Option<String> = None;
     for index in 0..archive.len() {
@@ -628,8 +628,8 @@ pub fn read_zip(path: &Path) -> Result<ExportDocument, String> {
 fn decode_document(text: &str) -> Result<ExportDocument, String> {
     // 先看 `kind` / `version`：旧版清单的隧道布局不同，用当前 schema 解码会
     // 得到“有名字、没有接入信息”的空隧道，因此必须先按版本走对应的布局。
-    let value: serde_json::Value = serde_json::from_str(text)
-        .map_err(|error| format!("配置清单格式不正确: {error}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| format!("配置清单格式不正确: {error}"))?;
     let kind = value
         .get("kind")
         .and_then(serde_json::Value::as_str)
@@ -647,8 +647,8 @@ fn decode_document(text: &str) -> Result<ExportDocument, String> {
         ));
     }
     if version < 2 {
-        let legacy: ExportDocumentV1 = serde_json::from_str(text)
-            .map_err(|error| format!("配置清单格式不正确: {error}"))?;
+        let legacy: ExportDocumentV1 =
+            serde_json::from_str(text).map_err(|error| format!("配置清单格式不正确: {error}"))?;
         return Ok(ExportDocument {
             version: EXPORT_VERSION,
             kind: legacy.kind,
@@ -676,12 +676,12 @@ fn decode_document(text: &str) -> Result<ExportDocument, String> {
         });
     }
     if version < 3 {
-        let legacy: ExportDocumentV2 = serde_json::from_str(text)
-            .map_err(|error| format!("配置清单格式不正确: {error}"))?;
+        let legacy: ExportDocumentV2 =
+            serde_json::from_str(text).map_err(|error| format!("配置清单格式不正确: {error}"))?;
         return Ok(upgrade_v2(legacy));
     }
-    let document: ExportDocument = serde_json::from_str(text)
-        .map_err(|error| format!("配置清单格式不正确: {error}"))?;
+    let document: ExportDocument =
+        serde_json::from_str(text).map_err(|error| format!("配置清单格式不正确: {error}"))?;
     Ok(document)
 }
 
@@ -1148,7 +1148,10 @@ mod tests {
         assert_eq!(imported.apps[0].group_id, imported_group.id);
         assert_eq!(imported.apps[0].tunnel_ids.len(), 1);
         assert_eq!(
-            imported.tunnel(&imported.apps[0].tunnel_ids[0]).unwrap().name,
+            imported
+                .tunnel(&imported.apps[0].tunnel_ids[0])
+                .unwrap()
+                .name,
             "生产"
         );
         assert!(!imported.apps[0].desired_on, "导入不恢复运行状态");
@@ -1677,7 +1680,8 @@ mod tests {
         let path = dir.path().join("repacked.zip");
         let file = std::fs::File::create(&path).unwrap();
         let mut writer = ZipWriter::new(file);
-        let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         writer.start_file("notes.txt", stored).unwrap();
         writer.write_all(b"ignore me").unwrap();
         writer.start_file("backup/manifest.json", stored).unwrap();
@@ -1791,9 +1795,15 @@ mod tests {
         assert_eq!(display_name(&long, "ops", "h").chars().count(), 40);
         assert_eq!(display_name("", "", ""), "root@SSH");
         assert_eq!(split_name("NAS", "外网", "x"), "NAS · 外网");
-        assert_eq!(split_name("NAS", "  ", "frp.example.com"), "NAS · frp.example.com");
+        assert_eq!(
+            split_name("NAS", "  ", "frp.example.com"),
+            "NAS · frp.example.com"
+        );
         assert_eq!(split_name("  ", "", ""), "SSH");
-        assert_eq!(split_name(&"名".repeat(40), "外网", "x").chars().count(), 40);
+        assert_eq!(
+            split_name(&"名".repeat(40), "外网", "x").chars().count(),
+            40
+        );
     }
 
     /// 用外部工具读写我们生成的压缩包，确认跨设备可交换（默认不跑）。

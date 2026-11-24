@@ -9,12 +9,12 @@ pub const PORT_PLACEHOLDER: &str = "{port}";
 pub const DEFAULT_GROUP_ID: &str = "default";
 pub const DEFAULT_GROUP_NAME: &str = "default";
 /// 文档版本历史：
-///  - 1：裸数组，SSH 接入信息与转发规则混在一条配置里；
-///  - 2：隧道 / 应用 / 应用组拆成独立实体；
-///  - 3：一条隧道持有**一组有序的 SSH 线路**；
-///  - 4：线路概念取消。一条隧道就是一次**确定的** SSH 接入（用户名 / 地址 / 端口 /
-///       跳板 / 凭据），多条接入由**应用**持有：应用保存一个有序的隧道列表，启动时
-///       按顺序尝试，本地端口对第三方透明。
+/// - 1：裸数组，SSH 接入信息与转发规则混在一条配置里；
+/// - 2：隧道 / 应用 / 应用组拆成独立实体；
+/// - 3：一条隧道持有**一组有序的 SSH 线路**；
+/// - 4：线路概念取消。一条隧道就是一次**确定的** SSH 接入（用户名 / 地址 / 端口 /
+///   跳板 / 凭据），多条接入由**应用**持有：应用保存一个有序的隧道列表，启动时
+///   按顺序尝试，本地端口对第三方透明。
 pub const SNAPSHOT_VERSION: u32 = 4;
 
 pub fn now_millis() -> u64 {
@@ -28,17 +28,12 @@ pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthType {
+    #[default]
     Password,
     PrivateKey,
-}
-
-impl Default for AuthType {
-    fn default() -> Self {
-        AuthType::Password
-    }
 }
 
 /// Ciphertext produced by `secrets.rs`. Plaintext never reaches this struct.
@@ -436,9 +431,7 @@ impl DockSnapshot {
         if self.version == 0 {
             self.version = SNAPSHOT_VERSION;
         }
-        if self.groups.is_empty() {
-            self.groups.push(AppGroup::default_group());
-        } else if !self.groups.iter().any(AppGroup::is_default) {
+        if self.groups.is_empty() || !self.groups.iter().any(AppGroup::is_default) {
             self.groups.push(AppGroup::default_group());
         }
         self.groups.sort_by_key(|group| {
@@ -1280,7 +1273,9 @@ mod tests {
             tunnels: vec![other, target.clone()],
             ..DockSnapshot::default()
         };
-        assert!(snapshot.credential_source_for_jump(&target, &target.jumps[0]).is_none());
+        assert!(snapshot
+            .credential_source_for_jump(&target, &target.jumps[0])
+            .is_none());
     }
 
     #[test]

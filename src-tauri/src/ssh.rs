@@ -438,10 +438,7 @@ impl Drop for SshTunnel {
 /// Authenticates through the whole jump chain of one tunnel without installing a
 /// local listener, then disconnects. Used by the tunnel connectivity test so a
 /// probe never touches a running application or binds a port.
-pub async fn probe(
-    context: &ConnectContext,
-    tunnel: &TunnelConfig,
-) -> Result<(), TunnelError> {
+pub async fn probe(context: &ConnectContext, tunnel: &TunnelConfig) -> Result<(), TunnelError> {
     let handles = dial_chain(context, tunnel).await?;
     disconnect_handles(&handles).await;
     Ok(())

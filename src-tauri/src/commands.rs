@@ -344,10 +344,13 @@ fn resolve_identity_file(
     raw: &str,
 ) -> Result<Option<String>, String> {
     let expanded = raw.trim().replace("%d", &home_dir().to_string_lossy());
-    let candidate = if expanded.starts_with("~/") || expanded.starts_with("~\\") {
-        home_dir().join(&expanded[2..])
-    } else if expanded.starts_with('~') {
-        home_dir().join(&expanded[1..])
+    let candidate = if let Some(rest) = expanded
+        .strip_prefix("~/")
+        .or_else(|| expanded.strip_prefix("~\\"))
+    {
+        home_dir().join(rest)
+    } else if let Some(rest) = expanded.strip_prefix('~') {
+        home_dir().join(rest)
     } else {
         let path = std::path::PathBuf::from(&expanded);
         if path.is_absolute() {
@@ -366,7 +369,10 @@ fn resolve_identity_file(
     if !canonical.starts_with(&root) {
         return Ok(None);
     }
-    let Some(name) = canonical.file_name().map(|name| name.to_string_lossy().to_string()) else {
+    let Some(name) = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+    else {
         return Ok(None);
     };
     match local.read_key(&name) {
@@ -737,9 +743,7 @@ fn build_app(
             continue;
         }
         if snapshot.tunnel(id).is_none() {
-            return Err(format!(
-                "所选隧道不存在（{id}），请重新选择可用隧道"
-            ));
+            return Err(format!("所选隧道不存在（{id}），请重新选择可用隧道"));
         }
         tunnel_ids.push(id.to_string());
     }
@@ -976,10 +980,20 @@ mod tests {
     async fn duplicate_tunnel_choices_collapse_but_keep_the_order() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Secrets::load(dir.path()).unwrap();
-        let a = build(tunnel_input("甲", "a.example.com"), None, &vault, &local_ssh())
-            .unwrap();
-        let b = build(tunnel_input("乙", "b.example.com"), None, &vault, &local_ssh())
-            .unwrap();
+        let a = build(
+            tunnel_input("甲", "a.example.com"),
+            None,
+            &vault,
+            &local_ssh(),
+        )
+        .unwrap();
+        let b = build(
+            tunnel_input("乙", "b.example.com"),
+            None,
+            &vault,
+            &local_ssh(),
+        )
+        .unwrap();
         let document = snapshot(&[a.clone(), b.clone()]);
         let mut input = app_input(&a.id);
         input.tunnel_ids = vec![b.id.clone(), a.id.clone(), b.id.clone()];
@@ -1022,7 +1036,7 @@ mod tests {
             &local_ssh(),
         )
         .unwrap();
-        let document = snapshot(&[tunnel.clone()]);
+        let document = snapshot(std::slice::from_ref(&tunnel));
         let mut input = app_input(&tunnel.id);
         input.tunnel_ids = vec![tunnel.id.clone(), "gone".into()];
         assert!(build_app(input, None, &document).is_err());
@@ -1164,7 +1178,7 @@ mod tests {
             &local_ssh(),
         )
         .unwrap();
-        let document = snapshot(&[tunnel.clone()]);
+        let document = snapshot(std::slice::from_ref(&tunnel));
 
         assert!(build_app(app_input(&tunnel.id), None, &document).is_ok());
 
@@ -1190,7 +1204,7 @@ mod tests {
             &local_ssh(),
         )
         .unwrap();
-        let document = snapshot(&[tunnel.clone()]);
+        let document = snapshot(std::slice::from_ref(&tunnel));
 
         let mut low_port = app_input(&tunnel.id);
         low_port.local_port = 80;
@@ -1265,7 +1279,7 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
             &local_ssh(),
         )
         .unwrap();
-        let document = snapshot(&[bastion.clone()]);
+        let document = snapshot(std::slice::from_ref(&bastion));
 
         let mut input = tunnel_input("内网", "inner.example.com");
         input.jumps = vec![JumpInput {
@@ -1294,7 +1308,9 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
             tunnels: vec![target.clone()],
             ..DockSnapshot::default()
         };
-        assert!(without_source.with_inherited_jump_credentials(&target).jumps[0]
+        assert!(without_source
+            .with_inherited_jump_credentials(&target)
+            .jumps[0]
             .credentials
             .has_secret());
     }
@@ -1310,7 +1326,7 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
             &local_ssh(),
         )
         .unwrap();
-        let document = snapshot(&[bastion.clone()]);
+        let document = snapshot(std::slice::from_ref(&bastion));
 
         let with_source = |source: crate::model::JumpCredentialSource| {
             let mut input = tunnel_input("内网", "inner.example.com");
@@ -1359,13 +1375,7 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
             },
             credential_from: None,
         }];
-        let config = build(
-            input,
-            None,
-            &vault,
-            &local_ssh(),
-        )
-        .unwrap();
+        let config = build(input, None, &vault, &local_ssh()).unwrap();
         let cipher = config.jumps[0].credentials.password_cipher.clone().unwrap();
         assert_eq!(vault.decrypt(&cipher).unwrap(), "manual-secret");
     }
@@ -1381,7 +1391,7 @@ QyNTUxOQAAACBw5c7cJ4cJy0n6b2nHf5G6b2nHf5G6b2nHf5G6b2nHf5G6bQAAAJg=\n\
             &local_ssh(),
         )
         .unwrap();
-        let document = snapshot(&[tunnel.clone()]);
+        let document = snapshot(std::slice::from_ref(&tunnel));
         let existing = ForwardApp {
             name: "Web".into(),
             tunnel_ids: vec![tunnel.id.clone()],

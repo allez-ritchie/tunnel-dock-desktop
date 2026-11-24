@@ -271,22 +271,12 @@ fn document_version(raw: &[u8]) -> u32 {
 }
 
 /// v3 文档布局：隧道上挂着一组线路，应用用单个 `tunnelId` 引用隧道。
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct DocumentV3 {
     tunnels: Vec<TunnelV3>,
     apps: Vec<AppV3>,
     groups: Vec<AppGroup>,
-}
-
-impl Default for DocumentV3 {
-    fn default() -> Self {
-        Self {
-            tunnels: Vec::new(),
-            apps: Vec::new(),
-            groups: Vec::new(),
-        }
-    }
 }
 
 impl DocumentV3 {
@@ -537,22 +527,12 @@ impl Default for AppV3 {
 }
 
 /// v2 文档布局：隧道上直接存一对 SSH 接入信息。
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct DocumentV2 {
     tunnels: Vec<TunnelV2>,
     apps: Vec<ForwardAppV2>,
     groups: Vec<AppGroup>,
-}
-
-impl Default for DocumentV2 {
-    fn default() -> Self {
-        Self {
-            tunnels: Vec::new(),
-            apps: Vec::new(),
-            groups: Vec::new(),
-        }
-    }
 }
 
 impl DocumentV2 {
@@ -706,21 +686,18 @@ fn legacy_endpoint_key(
         .iter()
         .map(|jump| {
             format!(
-                "{}:{}:{}:{}",
-                jump.host,
-                jump.port,
-                jump.username,
-                format!("{:?}", jump.credentials.auth_type)
+                "{}:{}:{}:{:?}",
+                jump.host, jump.port, jump.username, jump.credentials.auth_type
             )
         })
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{:?}|{}|{}|{}",
         ssh_host,
         ssh_port,
         ssh_user,
-        format!("{:?}", credentials.auth_type),
+        credentials.auth_type,
         credentials.password_cipher.as_deref().unwrap_or(""),
         credentials.private_key_cipher.as_deref().unwrap_or(""),
         jump_key
@@ -874,7 +851,7 @@ impl Default for LegacyTunnelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AppStatus, AppBlockReason};
+    use crate::model::{AppBlockReason, AppStatus};
 
     fn credentials() -> SshCredentials {
         SshCredentials {
@@ -1238,7 +1215,10 @@ mod tests {
     #[test]
     fn split_tunnel_names_stay_readable_and_bounded() {
         assert_eq!(split_tunnel_name("NAS", "外网", "x"), "NAS · 外网");
-        assert_eq!(split_tunnel_name("NAS", "  ", "frp.example.com"), "NAS · frp.example.com");
+        assert_eq!(
+            split_tunnel_name("NAS", "  ", "frp.example.com"),
+            "NAS · frp.example.com"
+        );
         assert_eq!(split_tunnel_name("  ", "", ""), "SSH");
         let long = split_tunnel_name(&"名".repeat(40), "外网", "x");
         assert_eq!(long.chars().count(), 40);
