@@ -100,6 +100,32 @@ cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
+## 持续集成
+
+GitHub Actions 上有两条流水线，定义在 `.github/workflows/`：
+
+| 工作流 | 触发条件 | 内容 |
+| --- | --- | --- |
+| `ci.yml`（校验） | 推送到 `main`、Pull Request、手动触发 | 三处版本号一致；`npm ci` + `npm run build` + `npm test`；`cargo fmt --check`、`cargo clippy -D warnings`、`cargo test` |
+| `build.yml`（构建安装包） | 推送 `v*` tag、Pull Request、手动触发 | Linux（`.deb` / `.rpm` / `.AppImage`）与 Windows（`.msi` / NSIS `.exe`）安装包，作为 workflow artifact 上传，保留 14 天 |
+
+补充说明：
+
+- Rust 工具链由 `rust-toolchain.toml` 固定（当前 `1.94.1`），本地与 CI 的 rustfmt / clippy
+  结果保持一致。升级时同时修改该文件与两个 workflow 里的 `toolchain`，然后重跑
+  `cargo fmt --all`、clippy 与测试。
+- CI 使用 Node.js 22 LTS（Vite 8 要求 `^20.19 || >=22.12`）。
+- 构建产物**未做代码签名**：Windows 首次安装会触发 SmartScreen 提示，Linux 的
+  `.deb` / `.rpm` 以 22.04 为基线构建以获得更好的发行版兼容性；macOS 暂不在 CI 范围内。
+- 版本号必须三处一致：`package.json`、`src-tauri/tauri.conf.json`、
+  `src-tauri/Cargo.toml`。发版打附注 tag，推 tag 时 CI 会校验 tag 与版本号匹配：
+
+```bash
+node .github/scripts/check-version.mjs --tag v1.0.0   # 本地预检
+git tag -a v1.0.0 -m "TunnelDock Desktop 1.0.0"
+git push origin v1.0.0
+```
+
 ## 快速上手
 
 1. 打开应用，左侧切到「隧道」，点“新建隧道”，填写：

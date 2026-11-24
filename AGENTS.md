@@ -96,10 +96,17 @@ npm run tauri build
 补充说明：
 
 - 不能提交无法编译的代码；提交前至少保证 `npm run build` 与 `cargo check` 通过。
+- GitHub Actions 在 `main` 推送与 PR 上强制以下门禁（`.github/workflows/ci.yml`），提交前
+  建议本地全部跑一遍：
+  `npm run build`、`npm test`、`cargo fmt --check`、
+  `cargo clippy --all-targets -- -D warnings`、`cargo test`。
+- Rust 工具链由 `rust-toolchain.toml` 固定（当前 1.94.1），本地与 CI 的 rustfmt / clippy
+  结果保持一致；升级时同步修改该文件与两个 workflow 里的 `toolchain`，并重跑 fmt/clippy。
 - 不能把调试代码、临时文件、密钥/令牌、构建产物提交到仓库。
 - 首次 `npm install` / `cargo build` 需要联网下载依赖。若 crates 源被镜像替换导致
   版本锁定异常，使用本机配置的镜像即可，**不要把本机镜像配置提交到仓库**。
 - Linux 打包依赖窗口系统库；无图形环境时以 `npm run build` + `cargo test` 作为验收基线。
+  完整安装包由 `build.yml` 在 tag / PR / 手动触发时产出（Linux 与 Windows），产物未签名。
 
 ### 3.1 手工端到端验证
 
@@ -219,6 +226,15 @@ build(tauri): 补充 Linux 打包所需的系统依赖说明
 - 不提交密钥、账号密码、`master.key`、`tunnels.json`、安装包产物、IDE 临时文件；
 - 不提交 `.agents/handoff/` 下的交接文档（仅模板保留跟踪），详见 4.2 节；
 - 破坏性变更使用 `!` 标注（如 `feat(api)!: ...`）并在正文说明迁移方式。
+
+### 5.4 版本号与发版 tag
+
+- 版本号有三处副本，必须同时修改并保持一致：`package.json`、
+  `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 的 `[package] version`。
+  CI 用 `.github/scripts/check-version.mjs` 校验，发送 PR 前可本地执行该脚本。
+- 发版使用**附注 tag**，形式为 `v<版本号>`（例如 `v1.0.0`），推送 tag 会触发
+  `build.yml` 打安装包；CI 会校验 tag 与三处版本号一致，不一致直接失败。
+- 版本号变更、打 tag 都属于独立改动，不要混进功能提交。
 
 ---
 
