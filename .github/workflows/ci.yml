@@ -43,7 +43,8 @@ jobs:
   rust:
     name: Rust（格式 + clippy + 测试）
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # 正常约 5 分钟；apt 镜像偶发变慢时单装依赖就要 20 分钟，这里留足余量。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: 安装 Tauri 系统依赖
