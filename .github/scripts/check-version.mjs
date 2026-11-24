@@ -27,10 +27,7 @@ const cargoVersion = readFileSync("src-tauri/Cargo.toml", "utf8").match(
 if (!pkgVersion || !tauriVersion || !cargoVersion) {
   fail("无法从 package.json / tauri.conf.json / Cargo.toml 读取版本号");
 }
-if (
-  pkgVersion !== tauriVersion ||
-  pkgVersion !== cargoVersion
-) {
+if (pkgVersion !== tauriVersion || pkgVersion !== cargoVersion) {
   fail(
     `三处版本号不一致：package.json=${pkgVersion}，` +
       `tauri.conf.json=${tauriVersion}，Cargo.toml=${cargoVersion}`,
